@@ -26,6 +26,7 @@ email: albertobsd@gmail.com
 
 #include "hash/sha256.h"
 #include "hash/ripemd160.h"
+#include "bsgs_cuda.h"
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 #include "getopt.h"
@@ -119,6 +120,7 @@ const char *Ccoinbuffer_default = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkm
 char *Ccoinbuffer = (char*) Ccoinbuffer_default;
 char *str_baseminikey = NULL;
 char *raw_baseminikey = NULL;
+char *str_partial_wif = NULL;
 char *minikeyN = NULL;
 int minikey_n_limit;
 	
@@ -216,6 +218,7 @@ void rmd160toaddress_dst(char *rmd,char *dst);
 void set_minikey(char *buffer,char *rawbuffer,int length);
 bool increment_minikey_index(char *buffer,char *rawbuffer,int index);
 void increment_minikey_N(char *rawbuffer);
+void decode_partial_wif(char *partial, Int *min_range, Int *max_range, int *compress);
 	
 void KECCAK_256(uint8_t *source, size_t size,uint8_t *dst);
 void generate_binaddress_eth(Point &publickey,unsigned char *dst_address);
@@ -298,6 +301,7 @@ int FLAGUPDATEFILE1 = 0;
 
 int FLAGSTRIDE = 0;
 int FLAGSEARCH = 2;
+int FLAGGPU = 0;
 int FLAGBITRANGE = 0;
 int FLAGRANGE = 0;
 int FLAGFILE = 0;
@@ -486,12 +490,14 @@ int main(int argc, char **argv)	{
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
+	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:gI:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
 		switch(c) {
+			case 'g':
+				FLAGGPU = 1;
+				break;
 			case 'h':
 				menu();
-			break;
-			case '6':
+				break;			case '6':
 				FLAGSKIPCHECKSUM = 1;
 				fprintf(stderr,"[W] Skipping checksums on files\n");
 			break;
@@ -666,6 +672,9 @@ int main(int argc, char **argv)	{
 				FLAG_N = 1;
 				str_N = optarg;
 			break;
+			case 'p':
+				str_partial_wif = optarg;
+			break;
 			case 'q':
 				FLAGQUIET	= 1;
 				printf("[+] Quiet thread output\n");
@@ -784,9 +793,29 @@ int main(int argc, char **argv)	{
 	
 	
 	if(  FLAGBSGSMODE == MODE_BSGS  && FLAGSTRIDE)	{
-		fprintf(stderr,"[E] Stride doesn't work with BSGS\n");
+		fprintf(stderr, "[E] Stride doesn't work with BSGS\n");
 		exit(EXIT_FAILURE);
 	}
+
+	if(str_partial_wif != NULL) {
+		int partial_compress = 0;
+		decode_partial_wif(str_partial_wif, &n_range_start, &n_range_end, &partial_compress);
+		FLAGRANGE = 1;
+		if(FLAGMODE != MODE_BSGS) {
+			FLAGMODE = MODE_BSGS;
+			printf("[+] Mode BSGS (auto-set from partial WIF)\n");
+		}
+		if(partial_compress) {
+			FLAGSEARCH = SEARCH_COMPRESS;
+			printf("[+] Search compress only (auto-set from partial WIF)\n");
+		} else {
+			FLAGSEARCH = SEARCH_UNCOMPRESS;
+			printf("[+] Search uncompress only (auto-set from partial WIF)\n");
+		}
+		n_range_diff.Set(&n_range_end);
+		n_range_diff.Sub(&n_range_start);
+	}
+
 	if(FLAGSTRIDE)	{
 		if(str_stride[0] == '0' && str_stride[1] == 'x')	{
 			stride.SetBase16(str_stride+2);
@@ -814,11 +843,13 @@ int main(int argc, char **argv)	{
 		printf("[+] Setting search for btc adddress\n");
 	}
 	if(FLAGRANGE) {
-		n_range_start.SetBase16(range_start);
+		if(range_start != NULL)
+			n_range_start.SetBase16(range_start);
 		if(n_range_start.IsZero())	{
 			n_range_start.AddOne();
 		}
-		n_range_end.SetBase16(range_end);
+		if(range_end != NULL)
+			n_range_end.SetBase16(range_end);
 		if(n_range_start.IsEqual(&n_range_end) == false ) {
 			if(  n_range_start.IsLower(&secp->order) &&  n_range_end.IsLowerOrEqual(&secp->order) )	{
 				if( n_range_start.IsGreater(&n_range_end)) {
@@ -2037,9 +2068,13 @@ int main(int argc, char **argv)	{
 		tid = (pthread_t *) calloc(NTHREADS,sizeof(pthread_t));
 #endif
 		checkpointer((void *)tid,__FILE__,"calloc","tid" ,__LINE__ -1 );
-		
-		for(j= 0;j < NTHREADS; j++)	{
-			tt = (tothread*) malloc(sizeof(struct tothread));
+
+		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
+			run_bsgs_cuda(&n_range_start, &n_range_end, OriginalPointsBSGS, bsgs_point_number, (FLAGSEARCH == SEARCH_COMPRESS));
+			exit(0);
+		}
+
+		for(j= 0;j < NTHREADS; j++)	{			tt = (tothread*) malloc(sizeof(struct tothread));
 			checkpointer((void *)tt,__FILE__,"malloc","tt" ,__LINE__ -1 );
 			tt->nt = j;
 			steps[j] = 0;
@@ -5755,8 +5790,8 @@ void menu() {
 	printf("-M          Matrix screen, feel like a h4x0r, but performance will dropped\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
-	printf("-q          Quiet the thread output\n");
-	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
+	printf("-p partial  Partial WIF private key, use * or ? for unknown characters\n");
+	printf("-q          Quiet the thread output\n");	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
 	printf("-R          Random, this is the default behavior\n");
 	printf("-s ns       Number of seconds for the stats output, 0 to omit output.\n");
 	printf("-S          S is for SAVING in files BSGS data (Bloom filters and bPtable)\n");
@@ -6686,4 +6721,70 @@ void calcualteindex(int i,Int *key)	{
 		key->Mult(&BSGS_M3_double);
 		key->Add(&BSGS_M3);
 	}
+}
+
+void decode_partial_wif(char *partial, Int *min_range, Int *max_range, int *compress) {
+	int i, len;
+	char s_min[128], s_max[128];
+	uint8_t min_bytes[128], max_bytes[128];
+	size_t min_sz = 128, max_sz = 128;
+	Int v_min, v_max;
+
+	len = strlen(partial);
+	if (len < 40 || len > 60) {
+		fprintf(stderr, "[E] Invalid WIF length %d. Expected around 51 or 52.\n", len);
+		exit(EXIT_FAILURE);
+	}
+
+	strcpy(s_min, partial);
+	strcpy(s_max, partial);
+
+	for (i = 0; i < len; i++) {
+		if (s_min[i] == '*' || s_min[i] == '?' || s_min[i] == '.') {
+			s_min[i] = '1';
+			s_max[i] = 'z';
+		}
+	}
+
+	if (!b58tobin(min_bytes, &min_sz, s_min, len)) {
+		fprintf(stderr, "[E] Error decoding min Base58\n");
+		exit(EXIT_FAILURE);
+	}
+	
+	if (!b58tobin(max_bytes, &max_sz, s_max, len)) {
+		fprintf(stderr, "[E] Error decoding max Base58\n");
+		exit(EXIT_FAILURE);
+	}
+
+	v_min.SetInt32(0);
+	for(i=0; i<(int)min_sz; i++) {
+		v_min.ShiftL(8);
+		v_min.Add((uint64_t)min_bytes[i]);
+	}
+	
+	v_max.SetInt32(0);
+	for(i=0; i<(int)max_sz; i++) {
+		v_max.ShiftL(8);
+		v_max.Add((uint64_t)max_bytes[i]);
+	}
+	
+	if (len == 51) {
+		v_min.ShiftR(32);
+		v_max.ShiftR(32);
+		*compress = 0;
+	} else if (len == 52) {
+		v_min.ShiftR(40);
+		v_max.ShiftR(40);
+		*compress = 1;
+	} else {
+		fprintf(stderr, "[W] WIF length %d is non-standard. Using raw range.\n", len);
+		v_min.ShiftR(32);
+		v_max.ShiftR(32);
+	}
+	
+	v_min.bits64[4] = 0;
+	v_max.bits64[4] = 0;
+	
+	min_range->Set(&v_min);
+	max_range->Set(&v_max);
 }

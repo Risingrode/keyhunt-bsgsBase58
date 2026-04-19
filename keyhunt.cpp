@@ -7,6 +7,7 @@ email: albertobsd@gmail.com
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <string>
 #include <math.h>
 #include <time.h>
 #include <vector>
@@ -123,6 +124,7 @@ char *Ccoinbuffer = (char*) Ccoinbuffer_default;
 char *str_baseminikey = NULL;
 char *raw_baseminikey = NULL;
 char *str_partial_wif = NULL;
+std::vector<std::string> str_pubkeys;
 char *minikeyN = NULL;
 int minikey_n_limit;
 	
@@ -492,7 +494,7 @@ int main(int argc, char **argv)	{
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:gI:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
+	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:gI:k:l:m:N:n:p:P:r:s:t:v:G:8:z:")) != -1) {
 		switch(c) {
 			case 'g':
 				FLAGGPU = 1;
@@ -677,6 +679,29 @@ int main(int argc, char **argv)	{
 			case 'p':
 				str_partial_wif = optarg;
 			break;
+			case 'P': {
+				// Support comma-separated pubkeys and multiple -P flags
+				std::string optarg_str(optarg);
+				size_t pos = 0, found;
+				while ((found = optarg_str.find(',', pos)) != std::string::npos) {
+					std::string pk = optarg_str.substr(pos, found - pos);
+					if (pk.length() >= 66) {
+						str_pubkeys.push_back(pk);
+						printf("[+] Target public key %zu: %s\n",str_pubkeys.size(),pk.c_str());
+					}
+					pos = found + 1;
+				}
+				std::string pk = optarg_str.substr(pos);
+				if (pk.length() >= 66) {
+					str_pubkeys.push_back(pk);
+					printf("[+] Target public key %zu: %s\n",str_pubkeys.size(),pk.c_str());
+				}
+				if (str_pubkeys.empty()) {
+					fprintf(stderr,"[E] No valid public key specified with -P (must be 66 or 130 hex chars)\n");
+					exit(EXIT_FAILURE);
+				}
+				break;
+			}
 			case 'q':
 				FLAGQUIET	= 1;
 				printf("[+] Quiet thread output\n");
@@ -816,6 +841,16 @@ int main(int argc, char **argv)	{
 		}
 		n_range_diff.Set(&n_range_end);
 		n_range_diff.Sub(&n_range_start);
+	}
+
+	if(!str_pubkeys.empty())	{
+		if(FLAGMODE != MODE_BSGS)	{
+			FLAGMODE = MODE_BSGS;
+			printf("[+] Mode BSGS (auto-set from -P pubkey)\n");
+		}
+	}
+	if(!str_pubkeys.empty() && !FLAGRANGE && !FLAGBITRANGE)	{
+		fprintf(stderr,"[W] -P used without -p, -r, or -b: no search range defined\n");
 	}
 
 	if(FLAGSTRIDE)	{
@@ -993,83 +1028,123 @@ int main(int argc, char **argv)	{
 	}
 	
 	if(FLAGMODE == MODE_BSGS )	{
-		printf("[+] Opening file %s\n",fileName);
-		fd = fopen(fileName,"rb");
-		if(fd == NULL)	{
-			fprintf(stderr,"[E] Can't open file %s\n",fileName);
-			exit(EXIT_FAILURE);
-		}
-		aux = (char*) malloc(1024);
-		checkpointer((void *)aux,__FILE__,"malloc","aux" ,__LINE__ - 1);
-		while(!feof(fd))	{
-			if(fgets(aux,1022,fd) == aux)	{
-				trim(aux," \t\n\r");
-				if(strlen(aux) >= 128)	{	//Length of a full address in hexadecimal without 04
-						N++;
-				}else	{
+		if(!str_pubkeys.empty())	{
+			// Public key(s) specified directly via -P option(s)
+			N = str_pubkeys.size();
+			bsgs_found = (int*) calloc(N,sizeof(int));
+			checkpointer((void *)bsgs_found,__FILE__,"calloc","bsgs_found" ,__LINE__ -1 );
+			OriginalPointsBSGS.reserve(N);
+			OriginalPointsBSGScompressed = (bool*) malloc(N*sizeof(bool));
+			checkpointer((void *)OriginalPointsBSGScompressed,__FILE__,"malloc","OriginalPointsBSGScompressed" ,__LINE__ -1 );
+			for(size_t pk_idx = 0; pk_idx < str_pubkeys.size(); pk_idx++)	{
+				if(!secp->ParsePublicKeyHex((char*)str_pubkeys[pk_idx].c_str(),OriginalPointsBSGS[pk_idx],OriginalPointsBSGScompressed[pk_idx]))	{
+					fprintf(stderr,"[E] Invalid public key: %s\n",str_pubkeys[pk_idx].c_str());
+					exit(EXIT_FAILURE);
+				}
+			}
+			// Determine search type from key types
+			bool all_compressed = true, all_uncompressed = true;
+			for(size_t pk_idx = 0; pk_idx < str_pubkeys.size(); pk_idx++)	{
+				if(OriginalPointsBSGScompressed[pk_idx])
+					all_uncompressed = false;
+				else
+					all_compressed = false;
+			}
+			if(!all_compressed && !all_uncompressed)	{
+				FLAGSEARCH = SEARCH_BOTH;
+				printf("[+] Search both compress and uncompress (mixed key types from -P)\n");
+			}	else if(all_compressed)	{
+				FLAGSEARCH = SEARCH_COMPRESS;
+				printf("[+] Search compress only (auto-set from public keys)\n");
+			}	else	{
+				FLAGSEARCH = SEARCH_UNCOMPRESS;
+				printf("[+] Search uncompress only (auto-set from public keys)\n");
+			}
+		}	else	{
+			// Read public keys from file
+			printf("[+] Opening file %s\n",fileName);
+			fd = fopen(fileName,"rb");
+			if(fd == NULL)	{
+				fprintf(stderr,"[E] Can't open file %s\n",fileName);
+				exit(EXIT_FAILURE);
+			}
+			aux = (char*) malloc(1024);
+			checkpointer((void *)aux,__FILE__,"malloc","aux" ,__LINE__ - 1);
+			while(!feof(fd))	{
+				if(fgets(aux,1022,fd) == aux)	{
+					trim(aux," \t\n\r");
+					if(strlen(aux) >= 128)	{	//Length of a full address in hexadecimal without 04
+							N++;
+					}else	{
+						if(strlen(aux) >= 66)	{
+							N++;
+						}
+					}
+				}
+			}
+			if(N == 0)	{
+				fprintf(stderr,"[E] There is no valid data in the file\n");
+				exit(EXIT_FAILURE);
+			}
+			bsgs_found = (int*) calloc(N,sizeof(int));
+			checkpointer((void *)bsgs_found,__FILE__,"calloc","bsgs_found" ,__LINE__ -1 );
+			OriginalPointsBSGS.reserve(N);
+			OriginalPointsBSGScompressed = (bool*) malloc(N*sizeof(bool));
+			checkpointer((void *)OriginalPointsBSGScompressed,__FILE__,"malloc","OriginalPointsBSGScompressed" ,__LINE__ -1 );
+			pointx_str = (char*) malloc(65);
+			checkpointer((void *)pointx_str,__FILE__,"malloc","pointx_str" ,__LINE__ -1 );
+			pointy_str = (char*) malloc(65);
+			checkpointer((void *)pointy_str,__FILE__,"malloc","pointy_str" ,__LINE__ -1 );
+			fseek(fd,0,SEEK_SET);
+			i = 0;
+			while(!feof(fd))	{
+				if(fgets(aux,1022,fd) == aux)	{
+					trim(aux," \t\n\r");
 					if(strlen(aux) >= 66)	{
-						N++;
+						stringtokenizer(aux,&tokenizerbsgs);
+						aux2 = nextToken(&tokenizerbsgs);
+						memset(pointx_str,0,65);
+						memset(pointy_str,0,65);
+						switch(strlen(aux2))	{
+							case 66:	//Compress
+
+								if(secp->ParsePublicKeyHex(aux2,OriginalPointsBSGS[i],OriginalPointsBSGScompressed[i]))	{
+									i++;
+								}
+								else	{
+									N--;
+								}
+
+							break;
+							case 130:	//With the 04
+
+								if(secp->ParsePublicKeyHex(aux2,OriginalPointsBSGS[i],OriginalPointsBSGScompressed[i]))	{
+									i++;
+								}
+								else	{
+									N--;
+								}
+
+							break;
+							default:
+								printf("Invalid length: %s\n",aux2);
+								N--;
+							break;
+						}
+						freetokenizer(&tokenizerbsgs);
 					}
 				}
 			}
+			fclose(fd);
 		}
-		if(N == 0)	{
-			fprintf(stderr,"[E] There is no valid data in the file\n");
-			exit(EXIT_FAILURE);
-		}
-		bsgs_found = (int*) calloc(N,sizeof(int));
-		checkpointer((void *)bsgs_found,__FILE__,"calloc","bsgs_found" ,__LINE__ -1 );
-		OriginalPointsBSGS.reserve(N);
-		OriginalPointsBSGScompressed = (bool*) malloc(N*sizeof(bool));
-		checkpointer((void *)OriginalPointsBSGScompressed,__FILE__,"malloc","OriginalPointsBSGScompressed" ,__LINE__ -1 );
-		pointx_str = (char*) malloc(65);
-		checkpointer((void *)pointx_str,__FILE__,"malloc","pointx_str" ,__LINE__ -1 );
-		pointy_str = (char*) malloc(65);
-		checkpointer((void *)pointy_str,__FILE__,"malloc","pointy_str" ,__LINE__ -1 );
-		fseek(fd,0,SEEK_SET);
-		i = 0;
-		while(!feof(fd))	{
-			if(fgets(aux,1022,fd) == aux)	{
-				trim(aux," \t\n\r");
-				if(strlen(aux) >= 66)	{
-					stringtokenizer(aux,&tokenizerbsgs);
-					aux2 = nextToken(&tokenizerbsgs);
-					memset(pointx_str,0,65);
-					memset(pointy_str,0,65);
-					switch(strlen(aux2))	{
-						case 66:	//Compress
-
-							if(secp->ParsePublicKeyHex(aux2,OriginalPointsBSGS[i],OriginalPointsBSGScompressed[i]))	{
-								i++;
-							}
-							else	{
-								N--;
-							}
-
-						break;
-						case 130:	//With the 04
-
-							if(secp->ParsePublicKeyHex(aux2,OriginalPointsBSGS[i],OriginalPointsBSGScompressed[i]))	{
-								i++;
-							}
-							else	{
-								N--;
-							}
-
-						break;
-						default:
-							printf("Invalid length: %s\n",aux2);
-							N--;
-						break;
-					}
-					freetokenizer(&tokenizerbsgs);
-				}
-			}
-		}
-		fclose(fd);
 		bsgs_point_number = N;
 		if(bsgs_point_number > 0)	{
+			if(!str_pubkeys.empty()) {
+			printf("[+] Added %u point(s) from -P option\n",bsgs_point_number);
+		}
+		else {
 			printf("[+] Added %u points from file\n",bsgs_point_number);
+		}
 		}
 		else	{
 			fprintf(stderr,"[E] The file don't have any valid publickeys\n");
@@ -5797,6 +5872,7 @@ void menu() {
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
 	printf("-p partial  Partial WIF private key, use * or ? for unknown characters\n");
+	printf("-P pubkey   Target public key(s) for BSGS search, comma-separated or multiple -P flags, compatible with -g GPU\n");
 	printf("-q          Quiet the thread output\n");	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
 	printf("-R          Random, this is the default behavior\n");
 	printf("-s ns       Number of seconds for the stats output, 0 to omit output.\n");

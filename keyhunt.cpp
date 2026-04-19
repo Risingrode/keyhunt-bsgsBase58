@@ -26,7 +26,9 @@ email: albertobsd@gmail.com
 
 #include "hash/sha256.h"
 #include "hash/ripemd160.h"
+#ifdef CRYPTO_GPU
 #include "bsgs_cuda.h"
+#endif
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
 #include "getopt.h"
@@ -2070,7 +2072,11 @@ int main(int argc, char **argv)	{
 		checkpointer((void *)tid,__FILE__,"calloc","tid" ,__LINE__ -1 );
 
 		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
+#ifdef CRYPTO_GPU
 			run_bsgs_cuda(&n_range_start, &n_range_end, OriginalPointsBSGS, bsgs_point_number, (FLAGSEARCH == SEARCH_COMPRESS));
+#else
+			fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build with CUDA support.\n");
+#endif
 			exit(0);
 		}
 

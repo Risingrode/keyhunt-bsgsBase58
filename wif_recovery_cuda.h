@@ -13,14 +13,15 @@ extern "C" {
 #endif
 
 /**
- * Recover missing WIF private key characters using GPU
+ * Recover missing WIF private key characters using CUDA checksum filtering.
+ * The caller is responsible for BSGS range/cache setup before invoking this.
  * 
  * @param partial_wif      Partial WIF with '*' or '?' for missing chars
  * @param missing_positions Array of positions where characters are missing
  * @param num_missing      Number of missing positions
  * @param target_pubkey    Target public key to match
  * @param target_pubkey_len Length of target public key
- * @param compressed       Whether to use compressed public keys
+ * @param compressed       Non-zero when the target public key is compressed
  * @param result_wif       Output buffer for recovered WIF (min 64 bytes)
  * @return 0 on success, 1 if not found, negative on error
  */
@@ -30,7 +31,7 @@ int cuda_wif_recovery(
     int num_missing,
     const uint8_t* target_pubkey,
     int target_pubkey_len,
-    bool compressed,
+    int compressed,
     char* result_wif
 );
 

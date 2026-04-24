@@ -30,6 +30,7 @@ email: albertobsd@gmail.com
 #include "hash/ripemd160.h"
 #ifdef CRYPTO_GPU
 #include "bsgs_cuda.h"
+#include "wif_recovery_cuda.h"
 #endif
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -426,6 +427,124 @@ Int n_range_aux;
 Int lambda,lambda2,beta,beta2;
 
 Secp256K1 *secp;
+
+#ifdef CRYPTO_GPU
+static bool is_wif_wildcard(char c) {
+	return c == '*' || c == '?' || c == '.';
+}
+
+static int hex_value(char c) {
+	if(c >= '0' && c <= '9') return c - '0';
+	if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+static bool hex_to_bytes(const char *hex,std::vector<uint8_t> &out) {
+	size_t len = strlen(hex);
+	if((len & 1) != 0) return false;
+	out.clear();
+	out.reserve(len / 2);
+	for(size_t i = 0; i < len; i += 2) {
+		int hi = hex_value(hex[i]);
+		int lo = hex_value(hex[i + 1]);
+		if(hi < 0 || lo < 0) return false;
+		out.push_back((uint8_t)((hi << 4) | lo));
+	}
+	return true;
+}
+#endif
+
+static void bytes_to_hex(const uint8_t *bytes,int len,char *dst,size_t dst_size) {
+	static const char hex[] = "0123456789abcdef";
+	size_t needed = ((size_t)len * 2) + 1;
+	if(dst_size < needed) {
+		if(dst_size > 0) dst[0] = 0;
+		return;
+	}
+	for(int i = 0; i < len; i++) {
+		dst[i * 2] = hex[(bytes[i] >> 4) & 0x0F];
+		dst[i * 2 + 1] = hex[bytes[i] & 0x0F];
+	}
+	dst[len * 2] = 0;
+}
+
+#ifdef CRYPTO_GPU
+static int collect_wif_missing_positions(const char *partial_wif,std::vector<int> &positions) {
+	positions.clear();
+	for(int i = 0; partial_wif[i] != 0; i++) {
+		if(is_wif_wildcard(partial_wif[i])) {
+			positions.push_back(i);
+		}
+	}
+	return (int)positions.size();
+}
+#endif
+
+extern "C" int verify_privkey_pubkey(const uint8_t* privkey_bytes, const uint8_t* target_pubkey, int target_pubkey_len, int compressed) {
+	if(privkey_bytes == NULL || target_pubkey == NULL || (target_pubkey_len != 33 && target_pubkey_len != 65)) {
+		return 0;
+	}
+	Int privkey;
+	privkey.Set32Bytes((unsigned char*)privkey_bytes);
+	if(privkey.IsZero() || privkey.IsGreaterOrEqual(&secp->order)) {
+		return 0;
+	}
+	Point publickey = secp->ComputePublicKey(&privkey);
+	char *pubhex = secp->GetPublicKeyHex(compressed != 0,publickey);
+	char targethex[132];
+	bytes_to_hex(target_pubkey,target_pubkey_len,targethex,sizeof(targethex));
+	int ok = strlen(pubhex) == strlen(targethex) && memcmp(pubhex,targethex,strlen(targethex)) == 0;
+	free(pubhex);
+	return ok;
+}
+
+#ifdef CRYPTO_GPU
+static int run_cuda_wif_recovery_for_loaded_points(const char *partial_wif) {
+	std::vector<int> missing_positions;
+	int num_missing = collect_wif_missing_positions(partial_wif,missing_positions);
+	if(num_missing == 0) {
+		fprintf(stderr,"[E] WIF recovery with -g needs at least one wildcard character\n");
+		return -2;
+	}
+
+	for(uint32_t k = 0; k < bsgs_point_number; k++) {
+		char *pubhex = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],OriginalPointsBSGS[k]);
+		std::vector<uint8_t> pubkey_bytes;
+		if(!hex_to_bytes(pubhex,pubkey_bytes)) {
+			fprintf(stderr,"[E] Internal error converting target public key to bytes\n");
+			free(pubhex);
+			return -2;
+		}
+		free(pubhex);
+
+		char recovered_wif[64] = {0};
+		int rc = cuda_wif_recovery(
+			partial_wif,
+			missing_positions.data(),
+			num_missing,
+			pubkey_bytes.data(),
+			(int)pubkey_bytes.size(),
+			OriginalPointsBSGScompressed[k] ? 1 : 0,
+			recovered_wif
+		);
+		if(rc == 0) {
+			printf("[+] SUCCESS\n");
+			printf("[+] Recovered WIF: %s\n",recovered_wif);
+			FILE *filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
+			if(filekey != NULL) {
+				fprintf(filekey,"Recovered WIF: %s\n",recovered_wif);
+				fclose(filekey);
+			}
+			return 0;
+		}
+		if(rc < 0) {
+			return rc;
+		}
+	}
+	return 1;
+}
+#endif
 
 int main(int argc, char **argv)	{
 	char buffer[2048];
@@ -2230,7 +2349,23 @@ int main(int argc, char **argv)	{
 
 		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
 			if(FLAGWIFRECOVERY) {
-				fprintf(stderr, "[W] CUDA BSGS backend is not used for WIF recovery yet; falling back to CPU BSGS\n");
+#ifdef CRYPTO_GPU
+				int cuda_wif_rc = run_cuda_wif_recovery_for_loaded_points(str_partial_wif);
+				if(cuda_wif_rc == 0) {
+					printf("All points were found\n");
+					exit(EXIT_SUCCESS);
+				}
+				if(cuda_wif_rc == 1) {
+					fprintf(stderr, "[E] CUDA WIF recovery did not find a matching key\n");
+				}
+				else {
+					fprintf(stderr, "[E] CUDA WIF recovery failed with code %d\n", cuda_wif_rc);
+				}
+				exit(EXIT_FAILURE);
+#else
+				fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build WIF recovery with CUDA support.\n");
+				exit(EXIT_FAILURE);
+#endif
 			}
 			else {
 #ifdef CRYPTO_GPU
@@ -5961,7 +6096,7 @@ void menu() {
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
 	printf("-p partial  Partial WIF private key, use * or ? for unknown characters\n");
-	printf("-P pubkey   Target public key(s) for BSGS search, comma-separated or multiple -P flags, compatible with -g GPU\n");
+	printf("-P pubkey   Target public key(s) for BSGS/WIF search, comma-separated or multiple -P flags\n");
 	printf("-q          Quiet the thread output\n");
 	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
 	printf("-R          Random, this is the default behavior\n");
@@ -5972,8 +6107,9 @@ void menu() {
 	printf("-v value    Search for vanity Address, only with -m vanity\n");
 	printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
 	printf("\nPartial WIF + public key BSGS example:\n\n");
-	printf("./keyhunt -m bsgs -p \"5K???????????????????????????????????????????????????\" -P 04... -g\n\n");
-	printf("The partial WIF defines the BSGS range, -P supplies the target public key, and -g selects CUDA when built with make gpu.\n\n");
+	printf("./keyhunt -m wif-recovery -p \"5K???????????????????????????????????????????????????\" -P 04... -S\n");
+	printf("./keyhunt -m wif-recovery -p \"5K???????????????????????????????????????????????????\" -P 04... -S -g\n\n");
+	printf("The partial WIF defines the BSGS range, -P supplies the target public key, -S saves BSGS cache files, and -g requires a CUDA build from make gpu.\n\n");
 	printf("Developed by AlbertoBSD\tTips BTC: 1Coffee1jV4gB5gaXfHgSHDz9xx9QSECVW\n");
 	printf("Thanks to Iceland always helping and sharing his ideas.\nTips to Iceland: bc1q39meky2mn5qjq704zz0nnkl0v7kj4uz6r529at\n\n");
 	exit(EXIT_FAILURE);

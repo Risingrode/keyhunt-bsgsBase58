@@ -1,16 +1,18 @@
 /*
  * WIF Recovery using CUDA GPU
- * Recover missing characters in WIF private keys using public key verification
+ * Recover missing characters in WIF private keys using CUDA checksum filtering.
+ * keyhunt prepares the BSGS range/cache before this CUDA candidate filter runs.
  * 
  * Algorithm:
  * 1. Parse partial WIF, identify missing positions
  * 2. Generate all possible base58 combinations on GPU
  * 3. Verify checksum (fast filter, eliminates 99.999% combinations)
- * 4. For checksum-passing combinations, compute public key and compare
+ * 4. Copy checksum-passing candidates back to the host for public-key verification
  */
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,17 +43,6 @@ __constant__ uint32_t d_sha256_k[64] = {
     0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-// 256-bit integer structure for secp256k1
-struct uint256 {
-    uint64_t v[4];
-};
-
-// Point on secp256k1 curve
-struct PointGPU {
-    uint256 x;
-    uint256 y;
-};
-
 // Result structure
 struct WIFResult {
     uint64_t combination_index;
@@ -60,19 +51,12 @@ struct WIFResult {
     uint8_t privkey[32];
 };
 
-// Device functions for 256-bit arithmetic
-__device__ __forceinline__ uint256 make_uint256(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
-    uint256 r;
-    r.v[0] = a; r.v[1] = b; r.v[2] = c; r.v[3] = d;
-    return r;
-}
-
-__device__ __forceinline__ bool is_zero256(const uint256& a) {
-    return (a.v[0] | a.v[1] | a.v[2] | a.v[3]) == 0;
-}
-
-__device__ __forceinline__ bool is_equal256(const uint256& a, const uint256& b) {
-    return (a.v[0] == b.v[0]) & (a.v[1] == b.v[1]) & (a.v[2] == b.v[2]) & (a.v[3] == b.v[3]);
+static int report_cuda_error(cudaError_t err, const char* operation) {
+    if (err == cudaSuccess) {
+        return 0;
+    }
+    fprintf(stderr, "[E] CUDA %s failed: %s\n", operation, cudaGetErrorString(err));
+    return -1;
 }
 
 // SHA256 helper functions
@@ -154,15 +138,15 @@ __device__ void sha256(const uint8_t* data, int len, uint8_t hash[32]) {
     
     // Prepare final block with padding
     int remaining = len - offset;
-    memset(block, 0, 64);
-    memcpy(block, data + offset, remaining);
+    for (int i = 0; i < 64; i++) block[i] = 0;
+    for (int i = 0; i < remaining; i++) block[i] = data[offset + i];
     block[remaining] = 0x80;
     
     // Add length in bits as big-endian 64-bit
     uint64_t bit_len = (uint64_t)len * 8;
     if (remaining >= 56) {
         sha256_transform(state, block);
-        memset(block, 0, 64);
+        for (int i = 0; i < 64; i++) block[i] = 0;
     }
     block[63] = (uint8_t)(bit_len);
     block[62] = (uint8_t)(bit_len >> 8);
@@ -228,6 +212,7 @@ __device__ bool base58_decode_wif(const char* input, int len, uint8_t* output, i
             carry = val >> 8;
         }
         while (carry > 0) {
+            if (decoded_len >= 64) return false;
             decoded[decoded_len++] = carry & 0xff;
             carry >>= 8;
         }
@@ -235,6 +220,7 @@ __device__ bool base58_decode_wif(const char* input, int len, uint8_t* output, i
     
     // Add leading zeros
     int total_len = leading_zeros + decoded_len;
+    if (total_len > 64) return false;
     for (int i = 0; i < leading_zeros; i++) {
         output[i] = 0;
     }
@@ -244,51 +230,6 @@ __device__ bool base58_decode_wif(const char* input, int len, uint8_t* output, i
     
     *out_len = total_len;
     return true;
-}
-
-// Base58 encode
-__device__ void base58_encode(const uint8_t* data, int len, char* output) {
-    int out_len = 0;
-    
-    // Count leading zeros
-    int leading_zeros = 0;
-    while (leading_zeros < len && data[leading_zeros] == 0) {
-        leading_zeros++;
-    }
-    
-    // Encode
-    uint8_t temp[64];
-    memcpy(temp, data, len);
-    
-    for (int i = 0; i < leading_zeros; i++) {
-        output[out_len++] = '1';
-    }
-    
-    // Convert to base58
-    int start = leading_zeros;
-    while (start < len) {
-        int remainder = 0;
-        for (int i = start; i < len; i++) {
-            int val = remainder * 256 + temp[i];
-            temp[i] = val / 58;
-            remainder = val % 58;
-        }
-        output[out_len++] = d_base58[remainder];
-        
-        // Skip leading zeros in temp
-        while (start < len && temp[start] == 0) {
-            start++;
-        }
-    }
-    
-    // Reverse output
-    for (int i = 0; i < out_len / 2; i++) {
-        char t = output[i];
-        output[i] = output[out_len - 1 - i];
-        output[out_len - 1 - i] = t;
-    }
-    
-    output[out_len] = '\0';
 }
 
 // Checksum verification (fast filter)
@@ -309,30 +250,23 @@ __device__ bool verify_checksum(const uint8_t* data, int data_len) {
            (hash[3] == data[data_len - 1]);
 }
 
-// Simplified secp256k1 point multiplication for GPU
-// This is a minimal implementation - full implementation would be more complex
-__device__ PointGPU compute_public_key(const uint256& privkey) {
-    PointGPU result;
-    // Simplified: In real implementation, this would do scalar multiplication
-    // For now, we'll use a placeholder that would be replaced with proper EC math
-    result.x = make_uint256(0, 0, 0, 0);
-    result.y = make_uint256(0, 0, 0, 0);
-    
-    // TODO: Implement proper secp256k1 scalar multiplication on GPU
-    // This requires modular arithmetic on 256-bit integers
-    
-    return result;
+__device__ bool is_canonical_wif_payload(const uint8_t* data, int data_len, int compressed) {
+    if (data[0] != 0x80) return false;
+    if (compressed) {
+        return data_len == 38 && data[33] == 0x01;
+    }
+    return data_len == 37;
 }
 
 // Kernel to process WIF combinations
 __global__ void wif_recovery_kernel(
     const char* partial_wif,
+    int wif_len,
     const int* missing_positions,
     int num_missing,
-    const uint8_t* target_pubkey,
-    int target_pubkey_len,
-    bool compressed,
+    int compressed,
     uint64_t start_index,
+    uint64_t total_combinations,
     uint64_t combinations_per_thread,
     WIFResult* results,
     int* result_count
@@ -341,13 +275,15 @@ __global__ void wif_recovery_kernel(
     uint64_t start_combo = start_index + thread_id * combinations_per_thread;
     uint64_t end_combo = start_combo + combinations_per_thread;
     
-    int wif_len = strlen(partial_wif);
     char candidate_wif[64];
     uint8_t decoded[64];
     
-    for (uint64_t combo = start_combo; combo < end_combo; combo++) {
+    for (uint64_t combo = start_combo; combo < end_combo && combo < total_combinations; combo++) {
         // Generate candidate WIF
-        strcpy(candidate_wif, partial_wif);
+        for (int i = 0; i < wif_len; i++) {
+            candidate_wif[i] = partial_wif[i];
+        }
+        candidate_wif[wif_len] = '\0';
         
         // Fill in missing positions
         uint64_t temp = combo;
@@ -368,12 +304,18 @@ __global__ void wif_recovery_kernel(
         if (!verify_checksum(decoded, decoded_len)) {
             continue;
         }
+
+        if (!is_canonical_wif_payload(decoded, decoded_len, compressed)) {
+            continue;
+        }
         
         // If checksum match found, save result to buffer
         int idx = atomicAdd(result_count, 1);
         if (idx < 1024) {
             results[idx].combination_index = combo;
-            strcpy(results[idx].wif, candidate_wif);
+            for (int i = 0; i <= wif_len; i++) {
+                results[idx].wif[i] = candidate_wif[i];
+            }
             for(int i = 0; i < 32; i++) {
                 results[idx].privkey[i] = decoded[1 + i]; // skip version byte
             }
@@ -389,99 +331,140 @@ extern "C" int cuda_wif_recovery(
     int num_missing,
     const uint8_t* target_pubkey,
     int target_pubkey_len,
-    bool compressed,
+    int compressed,
     char* result_wif
 ) {
+    if (partial_wif == NULL || missing_positions == NULL || target_pubkey == NULL || result_wif == NULL) {
+        fprintf(stderr, "[E] CUDA WIF recovery received a null input\n");
+        return -2;
+    }
+    if (target_pubkey_len != 33 && target_pubkey_len != 65) {
+        fprintf(stderr, "[E] Invalid target public key length for CUDA WIF recovery: %d\n", target_pubkey_len);
+        return -2;
+    }
+    if ((compressed && target_pubkey_len != 33) || (!compressed && target_pubkey_len != 65)) {
+        fprintf(stderr, "[E] Public key compression does not match CUDA WIF mode\n");
+        return -2;
+    }
+    if (num_missing <= 0) {
+        fprintf(stderr, "[E] CUDA WIF recovery needs at least one missing WIF character\n");
+        return -2;
+    }
+    int wif_len = (int)strlen(partial_wif);
+    if (wif_len <= 0 || wif_len >= 64) {
+        fprintf(stderr, "[E] Invalid WIF length for CUDA recovery: %d\n", wif_len);
+        return -2;
+    }
+    for (int i = 0; i < num_missing; i++) {
+        if (missing_positions[i] < 0 || missing_positions[i] >= wif_len) {
+            fprintf(stderr, "[E] Invalid missing WIF position for CUDA recovery: %d\n", missing_positions[i]);
+            return -2;
+        }
+    }
+
     // Check CUDA device
-    int device_count;
-    cudaGetDeviceCount(&device_count);
+    int device_count = 0;
+    if (report_cuda_error(cudaGetDeviceCount(&device_count), "device count") != 0) {
+        return -1;
+    }
     if (device_count == 0) {
         fprintf(stderr, "[E] No CUDA devices found\n");
         return -1;
     }
     
-    cudaSetDevice(0);
+    if (report_cuda_error(cudaSetDevice(0), "set device") != 0) {
+        return -1;
+    }
     
     // Calculate total combinations
     uint64_t total_combinations = 1;
+    const uint64_t max_combinations = 1000000000000ULL;
     for (int i = 0; i < num_missing; i++) {
+        if (total_combinations > max_combinations / 58) {
+            fprintf(stderr, "[E] Too many combinations. Max ~10^12\n");
+            return -2;
+        }
         total_combinations *= 58;
-        if (total_combinations > 1000000000000ULL) {
-            fprintf(stderr, "[E] Too many combinations (%llu). Max ~10^12\n", total_combinations);
+        if (total_combinations > max_combinations) {
+            fprintf(stderr, "[E] Too many combinations (%" PRIu64 "). Max ~10^12\n", total_combinations);
             return -2;
         }
     }
     
-    printf("[+] Total combinations: %llu\n", total_combinations);
+    printf("[+] Total combinations: %" PRIu64 "\n", total_combinations);
     
     // Allocate device memory
-    char* d_partial_wif;
-    int* d_missing_positions;
-    uint8_t* d_target_pubkey;
-    WIFResult* d_results;
-    int* d_result_count;
-    
-    int wif_len = strlen(partial_wif);
-    cudaMalloc(&d_partial_wif, wif_len + 1);
-    cudaMalloc(&d_missing_positions, num_missing * sizeof(int));
-    cudaMalloc(&d_target_pubkey, target_pubkey_len);
+    char* d_partial_wif = NULL;
+    int* d_missing_positions = NULL;
+    WIFResult* d_results = NULL;
+    int* d_result_count = NULL;
+    WIFResult* h_results = NULL;
     int max_results = 1024;
-    cudaMalloc(&d_results, max_results * sizeof(WIFResult));
-    cudaMalloc(&d_result_count, sizeof(int));
-    
-    // Copy data to device
-    cudaMemcpy(d_partial_wif, partial_wif, wif_len + 1, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_missing_positions, missing_positions, num_missing * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_target_pubkey, target_pubkey, target_pubkey_len, cudaMemcpyHostToDevice);
-    
     int zero = 0;
-    cudaMemcpy(d_result_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
-    
-    // Configure kernel launch
     int threads_per_block = 256;
     int blocks = 1024;
-    uint64_t combinations_per_thread = (total_combinations + (blocks * threads_per_block) - 1) / (blocks * threads_per_block);
+    int h_result_count = 0;
+    int results_to_copy = 0;
+    int match_found = 0;
+    int rc = -1;
+    uint64_t combinations_per_thread = 0;
+    result_wif[0] = '\0';
+
+    if (report_cuda_error(cudaMalloc((void**)&d_partial_wif, wif_len + 1), "allocate partial WIF") != 0) goto cleanup;
+    if (report_cuda_error(cudaMalloc((void**)&d_missing_positions, num_missing * sizeof(int)), "allocate missing positions") != 0) goto cleanup;
+    if (report_cuda_error(cudaMalloc((void**)&d_results, max_results * sizeof(WIFResult)), "allocate result buffer") != 0) goto cleanup;
+    if (report_cuda_error(cudaMalloc((void**)&d_result_count, sizeof(int)), "allocate result count") != 0) goto cleanup;
+    
+    // Copy data to device
+    if (report_cuda_error(cudaMemcpy(d_partial_wif, partial_wif, wif_len + 1, cudaMemcpyHostToDevice), "copy partial WIF") != 0) goto cleanup;
+    if (report_cuda_error(cudaMemcpy(d_missing_positions, missing_positions, num_missing * sizeof(int), cudaMemcpyHostToDevice), "copy missing positions") != 0) goto cleanup;
+    
+    if (report_cuda_error(cudaMemcpy(d_result_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear result count") != 0) goto cleanup;
+    
+    // Configure kernel launch
+    combinations_per_thread = (total_combinations + (blocks * threads_per_block) - 1) / (blocks * threads_per_block);
     
     printf("[+] Launching kernel: %d blocks, %d threads\n", blocks, threads_per_block);
-    printf("[+] Combinations per thread: %llu\n", combinations_per_thread);
+    printf("[+] Combinations per thread: %" PRIu64 "\n", combinations_per_thread);
     
     // Launch kernel
     wif_recovery_kernel<<<blocks, threads_per_block>>>(
         d_partial_wif,
+        wif_len,
         d_missing_positions,
         num_missing,
-        d_target_pubkey,
-        target_pubkey_len,
         compressed,
         0, // start_index
+        total_combinations,
         combinations_per_thread,
         d_results,
         d_result_count
     );
     
-    cudaDeviceSynchronize();
+    if (report_cuda_error(cudaGetLastError(), "launch WIF recovery kernel") != 0) goto cleanup;
+    if (report_cuda_error(cudaDeviceSynchronize(), "synchronize WIF recovery kernel") != 0) goto cleanup;
     
     // Check results
-    int h_result_count;
-    cudaMemcpy(&h_result_count, d_result_count, sizeof(int), cudaMemcpyDeviceToHost);
+    if (report_cuda_error(cudaMemcpy(&h_result_count, d_result_count, sizeof(int), cudaMemcpyDeviceToHost), "copy result count") != 0) goto cleanup;
     
-    int results_to_copy = (h_result_count > max_results) ? max_results : h_result_count;
-    WIFResult* h_results = (WIFResult*)malloc(results_to_copy * sizeof(WIFResult));
-    
-    if (results_to_copy > 0) {
-        cudaMemcpy(h_results, d_results, results_to_copy * sizeof(WIFResult), cudaMemcpyDeviceToHost);
+    results_to_copy = (h_result_count > max_results) ? max_results : h_result_count;
+    if (h_result_count > max_results) {
+        fprintf(stderr, "[W] CUDA found %d checksum candidates; verifying the first %d\n", h_result_count, max_results);
+    }
+    h_results = (WIFResult*)malloc(results_to_copy * sizeof(WIFResult));
+    if (results_to_copy > 0 && h_results == NULL) {
+        fprintf(stderr, "[E] Failed to allocate host result buffer\n");
+        goto cleanup;
     }
     
-    // Cleanup GPU
-    cudaFree(d_partial_wif);
-    cudaFree(d_missing_positions);
-    cudaFree(d_target_pubkey);
-    cudaFree(d_results);
-    cudaFree(d_result_count);
-    
+    if (results_to_copy > 0) {
+        if (report_cuda_error(cudaMemcpy(h_results, d_results, results_to_copy * sizeof(WIFResult), cudaMemcpyDeviceToHost), "copy WIF candidates") != 0) {
+            goto cleanup;
+        }
+    }
+
     printf("[+] GPU found %d valid WIF checksum candidates. Verifying public keys...\n", h_result_count);
     
-    int match_found = 0;
     for(int i = 0; i < results_to_copy; i++) {
         if(verify_privkey_pubkey(h_results[i].privkey, target_pubkey, target_pubkey_len, compressed)) {
             strcpy(result_wif, h_results[i].wif);
@@ -490,13 +473,20 @@ extern "C" int cuda_wif_recovery(
             break;
         }
     }
-    
-    free(h_results);
-    
+
     if (match_found) {
-        return 0;
+        rc = 0;
+        goto cleanup;
     }
     
     printf("[-] No match found\n");
-    return 1;
+    rc = 1;
+
+cleanup:
+    if (d_partial_wif != NULL) cudaFree(d_partial_wif);
+    if (d_missing_positions != NULL) cudaFree(d_missing_positions);
+    if (d_results != NULL) cudaFree(d_results);
+    if (d_result_count != NULL) cudaFree(d_result_count);
+    free(h_results);
+    return rc;
 }

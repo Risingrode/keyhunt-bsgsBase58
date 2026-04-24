@@ -5,6 +5,8 @@ keyhunt
 bsgsd
 KEYFOUNDKEYFOUND.txt
 VANITYKEYFOUND.txt
+test_cases.txt
+test_commands.sh
 *.dat
 *.tbl
 *.blm

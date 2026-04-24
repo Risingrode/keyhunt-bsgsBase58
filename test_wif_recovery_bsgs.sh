@@ -1,11 +1,11 @@
 #!/bin/bash
-# GPU BSGS WIF Recovery 测试脚本
+# CUDA WIF + BSGS cache recovery 测试脚本
 # 使用方法: ./test_wif_recovery_bsgs.sh
 
-set -e
+set -euo pipefail
 
 echo "=========================================="
-echo " GPU BSGS WIF Recovery 测试"
+echo " CUDA WIF + BSGS cache Recovery 测试"
 echo "=========================================="
 
 # 颜色定义
@@ -13,6 +13,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
 
 # 检查keyhunt是否编译
 if [ ! -f "./keyhunt" ]; then
@@ -22,9 +24,9 @@ fi
 
 # 生成测试用例
 echo -e "${YELLOW}[1/4] 生成测试用例...${NC}"
-python3 generate_bsgs_test_case.py
+python3 generate_bsgs_test_case.py --n 0x100000 --output-dir "$TMPDIR"
 
-if [ ! -f "test_cases.txt" ]; then
+if [ ! -f "$TMPDIR/test_cases.txt" ]; then
     echo -e "${RED}[ERROR] 测试用例生成失败${NC}"
     exit 1
 fi
@@ -32,7 +34,7 @@ fi
 echo -e "${GREEN}[OK] 测试用例已生成${NC}"
 
 # 运行测试
-echo -e "${YELLOW}[2/4] 运行GPU BSGS WIF恢复测试...${NC}"
+echo -e "${YELLOW}[2/4] 运行CUDA WIF恢复测试...${NC}"
 
 PASS=0
 FAIL=0
@@ -51,10 +53,18 @@ while IFS='|' read -r PARTIAL_WIF EXPECTED_WIF PUBKEY COMPRESSED; do
     echo "  公钥: ${PUBKEY:0:20}..."
 
     # 运行keyhunt
-    if [ "$COMPRESSED" = "1" ]; then
-        RESULT=$(timeout 120 ./keyhunt -m wif-recovery -p "$PARTIAL_WIF" -P "$PUBKEY" -g 2>&1 || true)
-    else
-        RESULT=$(timeout 120 ./keyhunt -m wif-recovery -p "$PARTIAL_WIF" -P "$PUBKEY" -g 2>&1 || true)
+    RESULT=$(timeout 120 ./keyhunt -m wif-recovery -p "$PARTIAL_WIF" -P "$PUBKEY" -n 0x100000 -S -q -s 0 -g 2>&1 || true)
+
+    if echo "$RESULT" | grep -q "GPU support not compiled"; then
+        echo -e "  ${RED}[FAIL] 当前 keyhunt 不是 CUDA 构建，请先运行 make gpu${NC}"
+        echo "$RESULT" | tail -8
+        exit 1
+    fi
+
+    if echo "$RESULT" | grep -q "falling back to CPU"; then
+        echo -e "  ${RED}[FAIL] GPU 测试不允许回退 CPU${NC}"
+        echo "$RESULT" | tail -8
+        exit 1
     fi
 
     # 检查结果
@@ -78,7 +88,7 @@ while IFS='|' read -r PARTIAL_WIF EXPECTED_WIF PUBKEY COMPRESSED; do
         FAIL=$((FAIL + 1))
     fi
 
-done < test_cases.txt
+done < "$TMPDIR/test_cases.txt"
 
 # 统计结果
 echo ""

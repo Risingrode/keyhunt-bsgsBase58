@@ -8,6 +8,7 @@ email: albertobsd@gmail.com
 #include <stdint.h>
 #include <string.h>
 #include <string>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <vector>
@@ -59,6 +60,7 @@ email: albertobsd@gmail.com
 #define MODE_PUB2RMD 4
 #define MODE_MINIKEYS 5
 #define MODE_VANITY 6
+#define MODE_WIF_RECOVERY 7
 
 #define SEARCH_UNCOMPRESS 0
 #define SEARCH_COMPRESS 1
@@ -174,6 +176,10 @@ int minimum_same_bytes(unsigned char* A,unsigned char* B, int length);
 
 void writekey(bool compressed,Int *key);
 void writekeyeth(Int *key);
+bool encode_wif(Int *key,bool compressed,char *dst,size_t dst_size);
+bool partial_wif_matches(const char *partial,const char *wif);
+bool bsgs_point_matches(uint32_t k_index,Point &point);
+int record_bsgs_key_found(uint32_t k_index,Int *keyfound);
 
 void checkpointer(void *ptr,const char *file,const char *function,const  char *name,int line);
 
@@ -232,7 +238,7 @@ char *bit_range_str_min;
 char *bit_range_str_max;
 
 const char *bsgs_modes[5] = {"sequential","backward","both","random","dance"};
-const char *modes[7] = {"xpoint","address","bsgs","rmd160","pub2rmd","minikeys","vanity"};
+const char *modes[8] = {"xpoint","address","bsgs","rmd160","pub2rmd","minikeys","vanity","wif-recovery"};
 const char *cryptos[3] = {"btc","eth","all"};
 const char *publicsearch[3] = {"uncompress","compress","both"};
 const char *default_fileName = "addresses.txt";
@@ -310,6 +316,7 @@ int FLAGBITRANGE = 0;
 int FLAGRANGE = 0;
 int FLAGFILE = 0;
 int FLAGMODE = MODE_ADDRESS;
+int FLAGWIFRECOVERY = 0;
 int FLAGCRYPTO = 0;
 int FLAGRAWDATA	= 0;
 int FLAGRANDOM = 0;
@@ -631,7 +638,7 @@ int main(int argc, char **argv)	{
 				printf("[+] Matrix screen\n");
 			break;
 			case 'm':
-				switch(indexOf(optarg,modes,7)) {
+				switch(indexOf(optarg,modes,8)) {
 					case MODE_XPOINT: //xpoint
 						FLAGMODE = MODE_XPOINT;
 						printf("[+] Mode xpoint\n");
@@ -666,6 +673,11 @@ int main(int argc, char **argv)	{
 							checkpointer((void *)vanity_bloom,__FILE__,"calloc","vanity_bloom" ,__LINE__ -1);
 						}
 					break;
+					case MODE_WIF_RECOVERY:
+						FLAGMODE = MODE_BSGS;
+						FLAGWIFRECOVERY = 1;
+						printf("[+] Mode WIF recovery via BSGS\n");
+					break;
 					default:
 						fprintf(stderr,"[E] Unknow mode value %s\n",optarg);
 						exit(EXIT_FAILURE);
@@ -685,14 +697,18 @@ int main(int argc, char **argv)	{
 				size_t pos = 0, found;
 				while ((found = optarg_str.find(',', pos)) != std::string::npos) {
 					std::string pk = optarg_str.substr(pos, found - pos);
-					if (pk.length() >= 66) {
+					while(!pk.empty() && isspace((unsigned char)pk.front())) pk.erase(pk.begin());
+					while(!pk.empty() && isspace((unsigned char)pk.back())) pk.pop_back();
+					if ((pk.length() == 66 || pk.length() == 130) && isValidHex((char*)pk.c_str())) {
 						str_pubkeys.push_back(pk);
 						printf("[+] Target public key %zu: %s\n",str_pubkeys.size(),pk.c_str());
 					}
 					pos = found + 1;
 				}
 				std::string pk = optarg_str.substr(pos);
-				if (pk.length() >= 66) {
+				while(!pk.empty() && isspace((unsigned char)pk.front())) pk.erase(pk.begin());
+				while(!pk.empty() && isspace((unsigned char)pk.back())) pk.pop_back();
+				if ((pk.length() == 66 || pk.length() == 130) && isValidHex((char*)pk.c_str())) {
 					str_pubkeys.push_back(pk);
 					printf("[+] Target public key %zu: %s\n",str_pubkeys.size(),pk.c_str());
 				}
@@ -813,24 +829,60 @@ int main(int argc, char **argv)	{
 		}
 	}
 	
-	if(  FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM)	{
+	if(  FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM) {
 		fprintf(stderr,"[E] Endomorphism doesn't work with BSGS\n");
 		exit(EXIT_FAILURE);
 	}
 	
 	
-	if(  FLAGBSGSMODE == MODE_BSGS  && FLAGSTRIDE)	{
+	if(  FLAGBSGSMODE == MODE_BSGS  && FLAGSTRIDE) {
 		fprintf(stderr, "[E] Stride doesn't work with BSGS\n");
 		exit(EXIT_FAILURE);
 	}
 
+	if(FLAGWIFRECOVERY && str_partial_wif == NULL) {
+		fprintf(stderr, "[E] WIF recovery mode requires -p partial_wif\n");
+		exit(EXIT_FAILURE);
+	}
+	if(str_partial_wif != NULL && str_pubkeys.empty() && FLAGFILE == 0) {
+		fprintf(stderr, "[E] Partial WIF recovery requires -P public_key or -f public_key_file\n");
+		exit(EXIT_FAILURE);
+	}
 	if(str_partial_wif != NULL) {
 		int partial_compress = 0;
+		if(!FLAGWIFRECOVERY) {
+			FLAGWIFRECOVERY = 1;
+			printf("[+] WIF recovery via BSGS enabled from partial WIF\n");
+		}
 		decode_partial_wif(str_partial_wif, &n_range_start, &n_range_end, &partial_compress);
+		if(n_range_end.IsLower(&secp->order)) {
+			n_range_end.AddOne();
+		}
+		else if(n_range_end.IsGreater(&secp->order)) {
+			n_range_end.Set(&secp->order);
+			fprintf(stderr, "[W] Partial WIF max range exceeds secp256k1 order; clamped to order\n");
+		}
+		if(n_range_start.IsGreaterOrEqual(&secp->order)) {
+			fprintf(stderr, "[E] Partial WIF min range is outside secp256k1 order\n");
+			exit(EXIT_FAILURE);
+		}
+		if(n_range_start.IsZero()) {
+			n_range_start.AddOne();
+		}
 		FLAGRANGE = 1;
+		if(FLAGBITRANGE || range_start != NULL || range_end != NULL) {
+			fprintf(stderr, "[W] Partial WIF defines the BSGS range; ignoring -b/-r range options\n");
+			FLAGBITRANGE = 0;
+			range_start = NULL;
+			range_end = NULL;
+		}
 		if(FLAGMODE != MODE_BSGS) {
 			FLAGMODE = MODE_BSGS;
 			printf("[+] Mode BSGS (auto-set from partial WIF)\n");
+		}
+		if(!FLAGSAVEREADFILE) {
+			FLAGSAVEREADFILE = 1;
+			printf("[+] BSGS cache read/write enabled for partial WIF recovery\n");
 		}
 		if(partial_compress) {
 			FLAGSEARCH = SEARCH_COMPRESS;
@@ -843,7 +895,7 @@ int main(int argc, char **argv)	{
 		n_range_diff.Sub(&n_range_start);
 	}
 
-	if(!str_pubkeys.empty())	{
+	if(!str_pubkeys.empty()) {
 		if(FLAGMODE != MODE_BSGS)	{
 			FLAGMODE = MODE_BSGS;
 			printf("[+] Mode BSGS (auto-set from -P pubkey)\n");
@@ -1033,7 +1085,7 @@ int main(int argc, char **argv)	{
 			N = str_pubkeys.size();
 			bsgs_found = (int*) calloc(N,sizeof(int));
 			checkpointer((void *)bsgs_found,__FILE__,"calloc","bsgs_found" ,__LINE__ -1 );
-			OriginalPointsBSGS.reserve(N);
+			OriginalPointsBSGS.resize(N);
 			OriginalPointsBSGScompressed = (bool*) malloc(N*sizeof(bool));
 			checkpointer((void *)OriginalPointsBSGScompressed,__FILE__,"malloc","OriginalPointsBSGScompressed" ,__LINE__ -1 );
 			for(size_t pk_idx = 0; pk_idx < str_pubkeys.size(); pk_idx++)	{
@@ -1088,7 +1140,7 @@ int main(int argc, char **argv)	{
 			}
 			bsgs_found = (int*) calloc(N,sizeof(int));
 			checkpointer((void *)bsgs_found,__FILE__,"calloc","bsgs_found" ,__LINE__ -1 );
-			OriginalPointsBSGS.reserve(N);
+			OriginalPointsBSGS.resize(N);
 			OriginalPointsBSGScompressed = (bool*) malloc(N*sizeof(bool));
 			checkpointer((void *)OriginalPointsBSGScompressed,__FILE__,"malloc","OriginalPointsBSGScompressed" ,__LINE__ -1 );
 			pointx_str = (char*) malloc(65);
@@ -1150,6 +1202,19 @@ int main(int argc, char **argv)	{
 			fprintf(stderr,"[E] The file don't have any valid publickeys\n");
 			exit(EXIT_FAILURE);
 		}
+		if(FLAGWIFRECOVERY) {
+			salir = 1;
+			for(j = 0; j < (int)bsgs_point_number; j++) {
+				if(bsgs_found[j] == 0 && record_bsgs_key_found((uint32_t)j,&n_range_start)) {
+					bsgs_found[j] = 1;
+				}
+				salir &= bsgs_found[j];
+			}
+			if(salir) {
+				printf("All points were found\n");
+				exit(EXIT_SUCCESS);
+			}
+		}
 		BSGS_N.SetInt32(0);
 		BSGS_M.SetInt32(0);
 		
@@ -1207,8 +1272,12 @@ int main(int argc, char **argv)	{
 			}
 			else	{
 				printf("[+] Range \n");
-				printf("[+] -- from : 0x%s\n",range_start);
-				printf("[+] -- to   : 0x%s\n",range_end);
+				hextemp = n_range_start.GetBase16();
+				printf("[+] -- from : 0x%s\n",hextemp);
+				free(hextemp);
+				hextemp = n_range_end.GetBase16();
+				printf("[+] -- to   : 0x%s\n",hextemp);
+				free(hextemp);
 			}
 		}
 		else	{	//Random start
@@ -1220,6 +1289,19 @@ int main(int argc, char **argv)	{
 		}
 		BSGS_CURRENT.Set(&n_range_start);
 
+		if(str_partial_wif != NULL && n_range_diff.IsLower(&BSGS_N)) {
+			n_range_end.Set(&n_range_start);
+			n_range_end.Add(&BSGS_N);
+			if(n_range_end.IsGreater(&secp->order)) {
+				n_range_end.Set(&secp->order);
+			}
+			n_range_diff.Set(&n_range_end);
+			n_range_diff.Sub(&n_range_start);
+			printf("[W] Partial WIF range is smaller than BSGS N; expanded end range for BSGS\n");
+			hextemp = n_range_end.GetBase16();
+			printf("[+] -- expanded to : 0x%s\n",hextemp);
+			free(hextemp);
+		}
 
 		if(n_range_diff.IsLower(&BSGS_N) )	{
 			fprintf(stderr,"[E] the given range is small\n");
@@ -1421,9 +1503,9 @@ int main(int argc, char **argv)	{
 		BSGS_MP3 = secp->ComputePublicKey(&BSGS_M3);
 		BSGS_MP3_double = secp->ComputePublicKey(&BSGS_M3_double);
 		
-		BSGS_AMP2.reserve(32);
-		BSGS_AMP3.reserve(32);
-		GSn.reserve(CPU_GRP_SIZE/2);
+		BSGS_AMP2.resize(32);
+		BSGS_AMP3.resize(32);
+		GSn.resize(CPU_GRP_SIZE/2);
 
 		i= 0;
 
@@ -2147,12 +2229,17 @@ int main(int argc, char **argv)	{
 		checkpointer((void *)tid,__FILE__,"calloc","tid" ,__LINE__ -1 );
 
 		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
+			if(FLAGWIFRECOVERY) {
+				fprintf(stderr, "[W] CUDA BSGS backend is not used for WIF recovery yet; falling back to CPU BSGS\n");
+			}
+			else {
 #ifdef CRYPTO_GPU
-			run_bsgs_cuda(&n_range_start, &n_range_end, OriginalPointsBSGS, bsgs_point_number, (FLAGSEARCH == SEARCH_COMPRESS));
+				run_bsgs_cuda(&n_range_start, &n_range_end, OriginalPointsBSGS, bsgs_point_number, (FLAGSEARCH == SEARCH_COMPRESS));
 #else
-			fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build with CUDA support.\n");
+				fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build with CUDA support.\n");
 #endif
-			exit(0);
+				exit(0);
+			}
 		}
 
 		for(j= 0;j < NTHREADS; j++)	{			tt = (tothread*) malloc(sizeof(struct tothread));
@@ -3888,17 +3975,126 @@ int bsgs_searchbinary(struct bsgs_xvalue *buffer,char *data,int64_t array_length
 	return r;
 }
 
+bool encode_wif(Int *key,bool compressed,char *dst,size_t dst_size) {
+	uint8_t payload[38],hash[32];
+	size_t payload_len = compressed ? 34 : 33;
+	size_t encoded_size = dst_size;
+	memset(payload,0,sizeof(payload));
+	payload[0] = 0x80;
+	key->Get32Bytes(payload + 1);
+	if(compressed) {
+		payload[33] = 0x01;
+	}
+	sha256(payload,payload_len,hash);
+	sha256(hash,32,hash);
+	memcpy(payload + payload_len,hash,4);
+	return b58enc(dst,&encoded_size,payload,payload_len + 4);
+}
+
+bool partial_wif_matches(const char *partial,const char *wif) {
+	if(partial == NULL) {
+		return true;
+	}
+	if(strlen(partial) != strlen(wif)) {
+		return false;
+	}
+	for(size_t i = 0; partial[i] != 0; i++) {
+		if(partial[i] == '*' || partial[i] == '?' || partial[i] == '.') {
+			continue;
+		}
+		if(partial[i] != wif[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool bsgs_point_matches(uint32_t k_index,Point &point) {
+	return point.x.IsEqual(&OriginalPointsBSGS[k_index].x) && point.y.IsEqual(&OriginalPointsBSGS[k_index].y);
+}
+
+int record_bsgs_key_found(uint32_t k_index,Int *keyfound) {
+	FILE *filekey;
+	Int output_key;
+	Point point_found;
+	char *hextemp,*aux_c;
+	char recovered_wif[64];
+	bool wif_ok = false;
+
+	output_key.Set(keyfound);
+	point_found = secp->ComputePublicKey(&output_key);
+
+	if(FLAGWIFRECOVERY && !bsgs_point_matches(k_index,point_found)) {
+		Int negated_key;
+		Point negated_point;
+		negated_key.Set(&secp->order);
+		negated_key.Sub(keyfound);
+		negated_point = secp->ComputePublicKey(&negated_key);
+		if(bsgs_point_matches(k_index,negated_point)) {
+			output_key.Set(&negated_key);
+			point_found.Set(negated_point);
+		}
+	}
+
+	if(FLAGWIFRECOVERY) {
+		if(!bsgs_point_matches(k_index,point_found)) {
+			return 0;
+		}
+		if(!encode_wif(&output_key,OriginalPointsBSGScompressed[k_index],recovered_wif,sizeof(recovered_wif))) {
+			fprintf(stderr,"[E] Failed to encode recovered WIF\n");
+			return 0;
+		}
+		if(!partial_wif_matches(str_partial_wif,recovered_wif)) {
+			fprintf(stderr,"[W] BSGS key matched the public key but not the partial WIF template: %s\n",recovered_wif);
+			return 0;
+		}
+		wif_ok = true;
+	}
+
+	hextemp = output_key.GetBase16();
+	printf("[+] Thread Key found privkey %s   \n",hextemp);
+	aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k_index],point_found);
+	printf("[+] Publickey %s\n",aux_c);
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+	WaitForSingleObject(write_keys, INFINITE);
+#else
+	pthread_mutex_lock(&write_keys);
+#endif
+
+	filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
+	if(filekey != NULL)	{
+		fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
+		if(wif_ok) {
+			fprintf(filekey,"Recovered WIF: %s\n",recovered_wif);
+		}
+		fclose(filekey);
+	}
+	if(wif_ok) {
+		printf("[+] SUCCESS\n");
+		printf("[+] Recovered WIF: %s\n",recovered_wif);
+	}
+
+#if defined(_WIN64) && !defined(__CYGWIN__)
+	ReleaseMutex(write_keys);
+#else
+	pthread_mutex_unlock(&write_keys);
+#endif
+
+	free(hextemp);
+	free(aux_c);
+	return 1;
+}
+
 #if defined(_WIN64) && !defined(__CYGWIN__)
 DWORD WINAPI thread_process_bsgs(LPVOID vargp) {
 #else
 void *thread_process_bsgs(void *vargp)	{
 #endif
-	// File-related variables
-	FILE* filekey;
 	struct tothread* tt;
 
 	// Character variables
-	char xpoint_raw[32], *aux_c, *hextemp;
+	char xpoint_raw[32], *aux_c;
 
 	// Integer variables
 	Int base_key, keyfound;
@@ -3907,7 +4103,7 @@ void *thread_process_bsgs(void *vargp)	{
 	Int dy, dyn, _s, _p, km, intaux;
 
 	// Point variables
-	Point base_point, point_aux, point_found;
+	Point base_point, point_aux;
 	Point startP;
 	Point pp, pn;
 	Point pts[CPU_GRP_SIZE];
@@ -4063,29 +4259,9 @@ pn.y.ModAdd(&GSn[i].y);
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
-								hextemp = keyfound.GetBase16();
-								printf("[+] Thread Key found privkey %s   \n",hextemp);
-								point_found = secp->ComputePublicKey(&keyfound);
-								aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
-								printf("[+] Publickey %s\n",aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								WaitForSingleObject(write_keys, INFINITE);
-#else
-								pthread_mutex_lock(&write_keys);
-#endif
-
-								filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
-								if(filekey != NULL)	{
-									fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
-									fclose(filekey);
+								if(!record_bsgs_key_found(k,&keyfound)) {
+									continue;
 								}
-								free(hextemp);
-								free(aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-				ReleaseMutex(write_keys);
-#else
-				pthread_mutex_unlock(&write_keys);
-#endif
 								bsgs_found[k] = 1;
 								salir = 1;
 								for(l = 0; l < bsgs_point_number && salir; l++)	{
@@ -4093,7 +4269,7 @@ pn.y.ModAdd(&GSn[i].y);
 								}
 								if(salir)	{
 									printf("All points were found\n");
-									exit(EXIT_FAILURE);
+									exit(FLAGWIFRECOVERY ? EXIT_SUCCESS : EXIT_FAILURE);
 								}
 							} //End if second check
 						}//End if first check
@@ -4130,11 +4306,10 @@ DWORD WINAPI thread_process_bsgs_random(LPVOID vargp) {
 void *thread_process_bsgs_random(void *vargp)	{
 #endif
 
-	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
+	char xpoint_raw[32],*aux_c;
 	Int base_key,keyfound,n_range_random;
-	Point base_point,point_aux,point_found;
+	Point base_point,point_aux;
 	uint32_t l,k,r,salir,thread_number,cycles;
 	
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
@@ -4312,30 +4487,9 @@ pn.y.ModAdd(&GSn[i].y);
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
-								hextemp = keyfound.GetBase16();
-								printf("[+] Thread Key found privkey %s    \n",hextemp);
-								point_found = secp->ComputePublicKey(&keyfound);
-								aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
-								printf("[+] Publickey %s\n",aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								WaitForSingleObject(write_keys, INFINITE);
-#else
-								pthread_mutex_lock(&write_keys);
-#endif
-
-								filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
-								if(filekey != NULL)	{
-									fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
-									fclose(filekey);
+								if(!record_bsgs_key_found(k,&keyfound)) {
+									continue;
 								}
-								free(hextemp);
-								free(aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								ReleaseMutex(write_keys);
-#else
-								pthread_mutex_unlock(&write_keys);
-#endif
-
 								bsgs_found[k] = 1;
 								salir = 1;
 								for(l = 0; l < bsgs_point_number && salir; l++)	{
@@ -4343,7 +4497,7 @@ pn.y.ModAdd(&GSn[i].y);
 								}
 								if(salir)	{
 									printf("All points were found\n");
-									exit(EXIT_FAILURE);
+									exit(FLAGWIFRECOVERY ? EXIT_SUCCESS : EXIT_FAILURE);
 								}
 							} //End if second check
 						}//End if first check
@@ -4503,7 +4657,7 @@ void init_generator()	{
 	Point G = secp->ComputePublicKey(&stride);
 	Point g;
 	g.Set(G);
-	Gn.reserve(CPU_GRP_SIZE / 2);
+	Gn.resize(CPU_GRP_SIZE / 2);
 	Gn[0] = g;
 	g = secp->DoubleDirect(g);
 	Gn[1] = g;
@@ -4912,10 +5066,9 @@ void *thread_process_bsgs_dance(void *vargp)	{
 
 	Point pts[CPU_GRP_SIZE];
 	Int dx[CPU_GRP_SIZE / 2 + 1];
-	Point pp,pn,startP,base_point,point_aux,point_found;
-	FILE *filekey;
+	Point pp,pn,startP,base_point,point_aux;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
+	char xpoint_raw[32],*aux_c;
 	Int base_key,keyfound,dy,dyn,_s,_p,km,intaux;
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
@@ -5117,30 +5270,9 @@ pn.y.ModAdd(&GSn[i].y);
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
-								hextemp = keyfound.GetBase16();
-								printf("[+] Thread Key found privkey %s   \n",hextemp);
-								point_found = secp->ComputePublicKey(&keyfound);
-								aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
-								printf("[+] Publickey %s\n",aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								WaitForSingleObject(write_keys, INFINITE);
-#else
-								pthread_mutex_lock(&write_keys);
-#endif
-
-								filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
-								if(filekey != NULL)	{
-									fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
-									fclose(filekey);
+								if(!record_bsgs_key_found(k,&keyfound)) {
+									continue;
 								}
-								free(hextemp);
-								free(aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								ReleaseMutex(write_keys);
-#else
-								pthread_mutex_unlock(&write_keys);
-#endif
-
 								bsgs_found[k] = 1;
 								salir = 1;
 								for(l = 0; l < bsgs_point_number && salir; l++)	{
@@ -5148,7 +5280,7 @@ pn.y.ModAdd(&GSn[i].y);
 								}
 								if(salir)	{
 									printf("All points were found\n");
-									exit(EXIT_FAILURE);
+									exit(FLAGWIFRECOVERY ? EXIT_SUCCESS : EXIT_FAILURE);
 								}
 							} //End if second check
 						}//End if first check
@@ -5187,11 +5319,10 @@ DWORD WINAPI thread_process_bsgs_backward(LPVOID vargp) {
 #else
 void *thread_process_bsgs_backward(void *vargp)	{
 #endif
-	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
+	char xpoint_raw[32],*aux_c;
 	Int base_key,keyfound;
-	Point base_point,point_aux,point_found;
+	Point base_point,point_aux;
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
 	
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
@@ -5375,30 +5506,9 @@ pn.y.ModAdd(&GSn[i].y);
 						if(r) {
 							r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 							if(r)	{
-								hextemp = keyfound.GetBase16();
-								printf("[+] Thread Key found privkey %s   \n",hextemp);
-								point_found = secp->ComputePublicKey(&keyfound);
-								aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
-								printf("[+] Publickey %s\n",aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								WaitForSingleObject(write_keys, INFINITE);
-#else
-								pthread_mutex_lock(&write_keys);
-#endif
-
-								filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
-								if(filekey != NULL)	{
-									fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
-									fclose(filekey);
+								if(!record_bsgs_key_found(k,&keyfound)) {
+									continue;
 								}
-								free(hextemp);
-								free(aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-								ReleaseMutex(write_keys);
-#else
-								pthread_mutex_unlock(&write_keys);
-#endif
-
 								bsgs_found[k] = 1;
 								salir = 1;
 								for(l = 0; l < bsgs_point_number && salir; l++)	{
@@ -5406,7 +5516,7 @@ pn.y.ModAdd(&GSn[i].y);
 								}
 								if(salir)	{
 									printf("All points were found\n");
-									exit(EXIT_FAILURE);
+									exit(FLAGWIFRECOVERY ? EXIT_SUCCESS : EXIT_FAILURE);
 								}
 							} //End if second check
 						}//End if first check
@@ -5444,11 +5554,10 @@ DWORD WINAPI thread_process_bsgs_both(LPVOID vargp) {
 #else
 void *thread_process_bsgs_both(void *vargp)	{
 #endif
-	FILE *filekey;
 	struct tothread *tt;
-	char xpoint_raw[32],*aux_c,*hextemp;
+	char xpoint_raw[32],*aux_c;
 	Int base_key,keyfound;
-	Point base_point,point_aux,point_found;
+	Point base_point,point_aux;
 	uint32_t k,l,r,salir,thread_number,entrar,cycles;
 	
 	IntGroup *grp = new IntGroup(CPU_GRP_SIZE / 2 + 1);
@@ -5659,30 +5768,9 @@ void *thread_process_bsgs_both(void *vargp)	{
 							if(r) {
 								r = bsgs_secondcheck(&base_key,((j*1024) + i),k,&keyfound);
 								if(r)	{
-									hextemp = keyfound.GetBase16();
-									printf("[+] Thread Key found privkey %s   \n",hextemp);
-									point_found = secp->ComputePublicKey(&keyfound);
-									aux_c = secp->GetPublicKeyHex(OriginalPointsBSGScompressed[k],point_found);
-									printf("[+] Publickey %s\n",aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-									WaitForSingleObject(write_keys, INFINITE);
-#else
-									pthread_mutex_lock(&write_keys);
-#endif
-
-									filekey = fopen("KEYFOUNDKEYFOUND.txt","a");
-									if(filekey != NULL)	{
-										fprintf(filekey,"Key found privkey %s\nPublickey %s\n",hextemp,aux_c);
-										fclose(filekey);
+									if(!record_bsgs_key_found(k,&keyfound)) {
+										continue;
 									}
-									free(hextemp);
-									free(aux_c);
-#if defined(_WIN64) && !defined(__CYGWIN__)
-									ReleaseMutex(write_keys);
-#else
-									pthread_mutex_unlock(&write_keys);
-#endif
-
 									bsgs_found[k] = 1;
 									salir = 1;
 									for(l = 0; l < bsgs_point_number && salir; l++)	{
@@ -5690,7 +5778,7 @@ void *thread_process_bsgs_both(void *vargp)	{
 									}
 									if(salir)	{
 										printf("All points were found\n");
-										exit(EXIT_FAILURE);
+										exit(FLAGWIFRECOVERY ? EXIT_SUCCESS : EXIT_FAILURE);
 									}
 								} //End if second check
 							}//End if first check
@@ -5864,26 +5952,28 @@ void menu() {
 	printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
 	printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
 	printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
+	printf("-g          Enable GPU acceleration (CUDA) for BSGS mode\n");
 	printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
 	printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
 	printf("-l look     What type of address/hash160 are you looking for <compress, uncompress, both> Only for rmd160 and address\n");
-	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity) default: address\n");
+	printf("-m mode     mode of search for cryptos. (bsgs, xpoint, rmd160, address, vanity, wif-recovery) default: address\n");
 	printf("-M          Matrix screen, feel like a h4x0r, but performance will dropped\n");
 	printf("-n number   Check for N sequential numbers before the random chosen, this only works with -R option\n");
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
 	printf("-p partial  Partial WIF private key, use * or ? for unknown characters\n");
 	printf("-P pubkey   Target public key(s) for BSGS search, comma-separated or multiple -P flags, compatible with -g GPU\n");
-	printf("-q          Quiet the thread output\n");	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
+	printf("-q          Quiet the thread output\n");
+	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
 	printf("-R          Random, this is the default behavior\n");
 	printf("-s ns       Number of seconds for the stats output, 0 to omit output.\n");
 	printf("-S          S is for SAVING in files BSGS data (Bloom filters and bPtable)\n");
-	printf("-6          to skip sha256 Checksum on data files");
+	printf("-6          to skip sha256 Checksum on data files\n");
 	printf("-t tn       Threads number, must be a positive integer\n");
 	printf("-v value    Search for vanity Address, only with -m vanity\n");
 	printf("-z value    Bloom size multiplier, only address,rmd160,vanity, xpoint, value >= 1\n");
-	printf("\nExample:\n\n");
-	printf("./keyhunt -m rmd160 -f tests/unsolvedpuzzles.rmd -b 66 -l compress -R -q -t 8\n\n");
-	printf("This line runs the program with 8 threads from the range 20000000000000000 to 40000000000000000 without stats output\n\n");
+	printf("\nPartial WIF + public key BSGS example:\n\n");
+	printf("./keyhunt -m bsgs -p \"5K???????????????????????????????????????????????????\" -P 04... -g\n\n");
+	printf("The partial WIF defines the BSGS range, -P supplies the target public key, and -g selects CUDA when built with make gpu.\n\n");
 	printf("Developed by AlbertoBSD\tTips BTC: 1Coffee1jV4gB5gaXfHgSHDz9xx9QSECVW\n");
 	printf("Thanks to Iceland always helping and sharing his ideas.\nTips to Iceland: bc1q39meky2mn5qjq704zz0nnkl0v7kj4uz6r529at\n\n");
 	exit(EXIT_FAILURE);
@@ -6839,13 +6929,13 @@ void decode_partial_wif(char *partial, Int *min_range, Int *max_range, int *comp
 	}
 
 	v_min.SetInt32(0);
-	for(i=0; i<(int)min_sz; i++) {
+	for(i=128 - (int)min_sz; i<128; i++) {
 		v_min.ShiftL(8);
 		v_min.Add((uint64_t)min_bytes[i]);
 	}
 	
 	v_max.SetInt32(0);
-	for(i=0; i<(int)max_sz; i++) {
+	for(i=128 - (int)max_sz; i<128; i++) {
 		v_max.ShiftL(8);
 		v_max.Add((uint64_t)max_bytes[i]);
 	}

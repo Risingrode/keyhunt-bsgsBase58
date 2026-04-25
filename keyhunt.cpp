@@ -505,7 +505,7 @@ extern "C" int verify_privkey_pubkey(const uint8_t* privkey_bytes, const uint8_t
 	return ok;
 }
 
-static int run_bsgs_wif_recovery_for_loaded_points(const char *partial_wif) {
+static int run_bsgs_wif_recovery_for_loaded_points(const char *partial_wif,bool use_gpu) {
 	std::vector<int> missing_positions;
 	int num_missing = collect_wif_missing_positions(partial_wif,missing_positions);
 	if(num_missing == 0) {
@@ -524,15 +524,35 @@ static int run_bsgs_wif_recovery_for_loaded_points(const char *partial_wif) {
 		free(pubhex);
 
 		char recovered_wif[64] = {0};
-		int rc = cpu_wif_recovery(
-			partial_wif,
-			missing_positions.data(),
-			num_missing,
-			pubkey_bytes.data(),
-			(int)pubkey_bytes.size(),
-			OriginalPointsBSGScompressed[k] ? 1 : 0,
-			recovered_wif
-		);
+		int rc = -1;
+		if(use_gpu) {
+#ifdef CRYPTO_GPU
+			printf("[+] WIF recovery GPU mode enabled\n");
+			rc = cuda_wif_recovery(
+				partial_wif,
+				missing_positions.data(),
+				num_missing,
+				pubkey_bytes.data(),
+				(int)pubkey_bytes.size(),
+				OriginalPointsBSGScompressed[k] ? 1 : 0,
+				recovered_wif
+			);
+#else
+			fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build with CUDA support.\n");
+			return -3;
+#endif
+		}
+		else {
+			rc = cpu_wif_recovery(
+				partial_wif,
+				missing_positions.data(),
+				num_missing,
+				pubkey_bytes.data(),
+				(int)pubkey_bytes.size(),
+				OriginalPointsBSGScompressed[k] ? 1 : 0,
+				recovered_wif
+			);
+		}
 		if(rc == 0) {
 			printf("[+] SUCCESS\n");
 			printf("[+] Recovered WIF: %s\n",recovered_wif);
@@ -1043,7 +1063,12 @@ int main(int argc, char **argv)	{
 	}
 	init_generator();
 	if(FLAGMODE == MODE_BSGS )	{
-		printf("[+] Mode BSGS %s\n",bsgs_modes[FLAGBSGSMODE]);
+		if(FLAGWIFRECOVERY) {
+			printf("[+] Mode WIF recovery %s\n",FLAGGPU ? "GPU" : "CPU BSGS");
+		}
+		else {
+			printf("[+] Mode BSGS %s\n",bsgs_modes[FLAGBSGSMODE]);
+		}
 	}
 	
 	if(FLAGFILE == 0) {
@@ -1328,7 +1353,7 @@ int main(int argc, char **argv)	{
 		if(FLAGWIFRECOVERY) {
 			std::vector<int> missing_positions;
 			if(str_partial_wif != NULL && collect_wif_missing_positions(str_partial_wif,missing_positions) > 0) {
-				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif);
+				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif,FLAGGPU != 0);
 				if(wif_rc == 0) {
 					printf("All points were found\n");
 					exit(EXIT_SUCCESS);
@@ -2368,7 +2393,7 @@ int main(int argc, char **argv)	{
 
 		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
 			if(FLAGWIFRECOVERY) {
-				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif);
+				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif,true);
 				if(wif_rc == 0) {
 					printf("All points were found\n");
 					exit(EXIT_SUCCESS);

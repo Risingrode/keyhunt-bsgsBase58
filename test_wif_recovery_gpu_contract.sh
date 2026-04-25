@@ -21,10 +21,15 @@ if grep -q "Too many combinations" <<< "$RESULT"; then
     exit 1
 fi
 
-if grep -q "GPU support not compiled" <<< "$RESULT"; then
+if grep -q "BSGS Mode CPU Recovery starting" <<< "$RESULT"; then
     echo "$RESULT"
-    echo "[FAIL] -g WIF recovery incorrectly required CUDA support" >&2
+    echo "[FAIL] -g WIF recovery fell back to the CPU recovery path" >&2
     exit 1
+fi
+
+if grep -q "GPU support not compiled" <<< "$RESULT"; then
+    echo "[PASS] -g WIF recovery refuses CPU fallback when CUDA support is not compiled"
+    exit 0
 fi
 
 if ! grep -q "SUCCESS" <<< "$RESULT"; then

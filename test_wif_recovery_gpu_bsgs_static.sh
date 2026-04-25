@@ -29,6 +29,16 @@ if ! grep -q 'h_choose_table_chars_for_memory' wif_recovery_cuda.cu || ! grep -q
     exit 1
 fi
 
+if ! grep -q 'h_bsgs_split_score' wif_recovery_cuda.cu || ! grep -q 'CUDA split planner selected' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS must choose A/B split using a performance-aware planner" >&2
+    exit 1
+fi
+
+if ! grep -q 'WIF_BSGS_MAX_MISSING_CHARS' wif_recovery_cuda.cu || grep -q 'supports 1..10 missing' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS must expose the extended missing-character limit" >&2
+    exit 1
+fi
+
 if grep -R -q '\buint256_ONE\b' secp256k1_gpu wif_recovery_cuda.cu; then
     echo "[FAIL] CUDA GPU math uses undefined uint256_ONE instead of UINT256_ONE" >&2
     exit 1

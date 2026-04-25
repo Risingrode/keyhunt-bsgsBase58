@@ -12,6 +12,10 @@ extern "C" int verify_privkey_pubkey(const uint8_t* privkey_bytes, const uint8_t
 
 static const char base58[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
+#define WIF_BSGS_MAX_TABLE_CHARS 5
+#define WIF_BSGS_MAX_SEARCH_CHARS 10
+#define WIF_BSGS_MAX_MISSING_CHARS (WIF_BSGS_MAX_TABLE_CHARS + WIF_BSGS_MAX_SEARCH_CHARS)
+
 static int get_base58_value(char c) {
     for (int i = 0; i < 58; i++) {
         if (base58[i] == c) return i;
@@ -350,6 +354,12 @@ extern "C" int cpu_wif_recovery(
     char *result_wif
 ) {
     if (num_missing == 0) return 1;
+    if (num_missing < 0 || num_missing > WIF_BSGS_MAX_MISSING_CHARS) {
+        fprintf(stderr,
+            "[E] CPU WIF BSGS recovery supports 1..%d missing characters in this build\n",
+            WIF_BSGS_MAX_MISSING_CHARS);
+        return 1;
+    }
     
     global_partial_wif = partial_wif;
     global_target_pubkey = target_pubkey;
@@ -372,8 +382,15 @@ extern "C" int cpu_wif_recovery(
     }
     
     num_B = num_missing / 2;
-    if (num_B > 5) num_B = 5;
+    if (num_B > WIF_BSGS_MAX_TABLE_CHARS) num_B = WIF_BSGS_MAX_TABLE_CHARS;
+    if (num_missing > WIF_BSGS_MAX_SEARCH_CHARS && num_B < num_missing - WIF_BSGS_MAX_SEARCH_CHARS) {
+        num_B = num_missing - WIF_BSGS_MAX_SEARCH_CHARS;
+    }
     num_A = num_missing - num_B;
+    if (num_A > WIF_BSGS_MAX_SEARCH_CHARS || num_B > WIF_BSGS_MAX_TABLE_CHARS) {
+        fprintf(stderr, "[E] CPU WIF BSGS split is too large: A=%d B=%d\n", num_A, num_B);
+        return 1;
+    }
     
     for(int i=0; i<num_B; i++) B_pos[i] = pos_copy[i];
     for(int i=0; i<num_A; i++) A_pos[i] = pos_copy[num_B + i];

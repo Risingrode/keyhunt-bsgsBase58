@@ -23,6 +23,9 @@ extern "C" {
  * @param target_pubkey_len 公钥字节长度（33=压缩，65=未压缩）
  * @param compressed        是否使用压缩公钥格式（影响WIF长度和偏移）
  * @param result_wif        输出缓冲区（至少64字节），成功时写入完整WIF
+ * Supports up to 15 missing Base58 characters in this build:
+ * up to 5 table-side chars and up to 10 search-side chars.
+ *
  * @return 0=成功找到, 1=未找到, -1=无CUDA设备, -2=参数无效, -3=GPU内存分配失败, -4=GPU内核错误
  */
 int cuda_wif_recovery_bsgs(

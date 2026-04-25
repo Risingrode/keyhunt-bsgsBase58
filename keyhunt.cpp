@@ -148,6 +148,12 @@ void init_generator();
 int searchbinary(struct address_value *buffer,char *data,int64_t array_length);
 void sleep_ms(int milliseconds);
 
+static void runtime_timer_start();
+static void runtime_timer_print_summary();
+static void format_elapsed_time(uint64_t elapsed_seconds,char *dst,size_t dst_size);
+static uint64_t runtime_elapsed_seconds();
+static inline int compare20(const void *lhs,const void *rhs);
+
 void _sort(struct address_value *arr,int64_t N);
 void _insertionsort(struct address_value *arr, int64_t n);
 void _introsort(struct address_value *arr,uint32_t depthLimit, int64_t n);
@@ -429,6 +435,101 @@ Int lambda,lambda2,beta,beta2;
 
 Secp256K1 *secp;
 
+static time_t runtime_started_at = 0;
+static int runtime_timer_active = 0;
+
+static void runtime_timer_start() {
+	runtime_started_at = time(NULL);
+	runtime_timer_active = 1;
+	atexit(runtime_timer_print_summary);
+}
+
+static uint64_t runtime_elapsed_seconds() {
+	if(!runtime_timer_active || runtime_started_at == 0) {
+		return 0;
+	}
+	time_t now = time(NULL);
+	if(now <= runtime_started_at) {
+		return 0;
+	}
+	return (uint64_t)(now - runtime_started_at);
+}
+
+static void format_elapsed_time(uint64_t elapsed_seconds,char *dst,size_t dst_size) {
+	uint64_t hours = elapsed_seconds / 3600;
+	uint64_t minutes = (elapsed_seconds / 60) % 60;
+	uint64_t seconds = elapsed_seconds % 60;
+	if(hours > 99) {
+		snprintf(dst,dst_size,"%" PRIu64 ":%02" PRIu64 ":%02" PRIu64,hours,minutes,seconds);
+	}
+	else {
+		snprintf(dst,dst_size,"%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,hours,minutes,seconds);
+	}
+}
+
+static void runtime_timer_print_summary() {
+	if(!runtime_timer_active) {
+		return;
+	}
+	char elapsed_buffer[32];
+	uint64_t elapsed_seconds = runtime_elapsed_seconds();
+	format_elapsed_time(elapsed_seconds,elapsed_buffer,sizeof(elapsed_buffer));
+	printf("[+] Elapsed time: %s (%" PRIu64 " seconds)\n",elapsed_buffer,elapsed_seconds);
+	fflush(stdout);
+	runtime_timer_active = 0;
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+static inline uint64_t load_be64_asm(const void *ptr) {
+	uint64_t value;
+	__asm__ __volatile__(
+		"movq (%1), %0\n\t"
+		"bswapq %0"
+		: "=&r"(value)
+		: "r"(ptr)
+		: "memory"
+	);
+	return value;
+}
+
+static inline uint32_t load_be32_asm(const void *ptr) {
+	uint32_t value;
+	__asm__ __volatile__(
+		"movl (%1), %0\n\t"
+		"bswapl %0"
+		: "=&r"(value)
+		: "r"(ptr)
+		: "memory"
+	);
+	return value;
+}
+#endif
+
+static inline int compare20(const void *lhs,const void *rhs) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+	const uint8_t *a = (const uint8_t*)lhs;
+	const uint8_t *b = (const uint8_t*)rhs;
+	uint64_t a64 = load_be64_asm(a);
+	uint64_t b64 = load_be64_asm(b);
+	if(a64 != b64) {
+		return a64 < b64 ? -1 : 1;
+	}
+	a64 = load_be64_asm(a + 8);
+	b64 = load_be64_asm(b + 8);
+	if(a64 != b64) {
+		return a64 < b64 ? -1 : 1;
+	}
+	uint32_t a32 = load_be32_asm(a + 16);
+	uint32_t b32 = load_be32_asm(b + 16);
+	if(a32 != b32) {
+		return a32 < b32 ? -1 : 1;
+	}
+	return 0;
+#else
+	return memcmp(lhs,rhs,20);
+#endif
+}
+
 static bool is_wif_wildcard(char c) {
 	return c == '*' || c == '?' || c == '.';
 }
@@ -586,6 +687,7 @@ int main(int argc, char **argv)	{
 	char *str_total = NULL;
 	char *str_pretotal = NULL;
 	char *str_divpretotal = NULL;
+	char elapsed_buffer[32];
 	char *bf_ptr = NULL;
 	char *bPload_threads_available;
 	FILE *fd,*fd_aux1,*fd_aux2,*fd_aux3;
@@ -972,6 +1074,8 @@ int main(int argc, char **argv)	{
 			break;
 		}
 	}
+
+	runtime_timer_start();
 	
 	if(  FLAGBSGSMODE == MODE_BSGS && FLAGENDOMORPHISM) {
 		fprintf(stderr,"[E] Endomorphism doesn't work with BSGS\n");
@@ -2574,14 +2678,15 @@ int main(int argc, char **argv)	{
 				str_seconds = seconds.GetBase10();
 				str_pretotal = pretotal.GetBase10();
 				str_total = total.GetBase10();
+				format_elapsed_time(runtime_elapsed_seconds(),elapsed_buffer,sizeof(elapsed_buffer));
 				
 				
 				if(pretotal.IsLower(&int_limits[0]))	{
 					if(FLAGMATRIX)	{
-						sprintf(buffer,"[+] Total %s keys in %s seconds: %s keys/s\n",str_total,str_seconds,str_pretotal);
+						sprintf(buffer,"[+] Total %s keys in %s seconds, elapsed %s: %s keys/s\n",str_total,str_seconds,elapsed_buffer,str_pretotal);
 					}
 					else	{
-						sprintf(buffer,"\r[+] Total %s keys in %s seconds: %s keys/s\r",str_total,str_seconds,str_pretotal);
+						sprintf(buffer,"\r[+] Total %s keys in %s seconds, elapsed %s: %s keys/s\r",str_total,str_seconds,elapsed_buffer,str_pretotal);
 					}
 				}
 				else	{
@@ -2600,14 +2705,14 @@ int main(int argc, char **argv)	{
 					div_pretotal.Div(&int_limits[salir ? i : i-1]);
 					str_divpretotal = div_pretotal.GetBase10();
 					if(FLAGMATRIX)	{
-						sprintf(buffer,"[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\n",str_total,str_seconds,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
+						sprintf(buffer,"[+] Total %s keys in %s seconds, elapsed %s: ~%s %s (%s keys/s)\n",str_total,str_seconds,elapsed_buffer,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
 					}
 					else	{
 						if(THREADOUTPUT == 1)	{
-							sprintf(buffer,"\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\r",str_total,str_seconds,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
+							sprintf(buffer,"\r[+] Total %s keys in %s seconds, elapsed %s: ~%s %s (%s keys/s)\r",str_total,str_seconds,elapsed_buffer,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
 						}
 						else	{
-							sprintf(buffer,"\r[+] Total %s keys in %s seconds: ~%s %s (%s keys/s)\r",str_total,str_seconds,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
+							sprintf(buffer,"\r[+] Total %s keys in %s seconds, elapsed %s: ~%s %s (%s keys/s)\r",str_total,str_seconds,elapsed_buffer,str_divpretotal,str_limits_prefixs[salir ? i : i-1],str_pretotal);
 						}
 					}
 					free(str_divpretotal);
@@ -2629,11 +2734,13 @@ int main(int argc, char **argv)	{
 		}
 	}while(continue_flag);
 	printf("\nEnd\n");
+	runtime_timer_print_summary();
 #ifdef _WIN64
 	CloseHandle(write_keys);
 	CloseHandle(write_random);
 	CloseHandle(bsgs_thread);
 #endif
+	return 0;
 }
 
 void pubkeytopubaddress_dst(char *pkey,int length,char *dst)	{
@@ -2695,7 +2802,7 @@ int searchbinary(struct address_value *buffer,char *data,int64_t array_length) {
 	half = array_length;
 	while(!r && half >= 1) {
 		half = (max - min)/2;
-		rcmp = memcmp(data,buffer[current+half].value,20);
+		rcmp = compare20(data,buffer[current+half].value);
 		if(rcmp == 0)	{
 			r = 1;	//Found!!
 		}
@@ -3244,7 +3351,7 @@ void *thread_process(void *vargp)	{
 														
 														publickey = secp->ComputePublicKey(&keyfound);
 														secp->GetHash160(P2PKH,true,publickey,(uint8_t*)publickeyhashrmd160);
-														if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160,20) != 0)	{
+														if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160) != 0)	{
 															keyfound.Neg();
 															keyfound.Add(&secp->order);
 														}
@@ -3270,7 +3377,7 @@ void *thread_process(void *vargp)	{
 															case 7:
 																publickey = secp->ComputePublicKey(&keyfound);
 																secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-																if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+																if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																	keyfound.Neg();
 																	keyfound.Add(&secp->order);
 																}
@@ -3280,7 +3387,7 @@ void *thread_process(void *vargp)	{
 																keyfound.ModMulK1order(&lambda);
 																publickey = secp->ComputePublicKey(&keyfound);
 																secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-																if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+																if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																	keyfound.Neg();
 																	keyfound.Add(&secp->order);
 																}
@@ -3290,7 +3397,7 @@ void *thread_process(void *vargp)	{
 																keyfound.ModMulK1order(&lambda2);
 																publickey = secp->ComputePublicKey(&keyfound);
 																secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-																if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+																if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																	keyfound.Neg();
 																	keyfound.Add(&secp->order);
 																}
@@ -3332,7 +3439,7 @@ void *thread_process(void *vargp)	{
 														case 1:
 															publickey = secp->ComputePublicKey(&keyfound);
 															generate_binaddress_eth(publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-															if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+															if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																keyfound.Neg();
 																keyfound.Add(&secp->order);
 															}
@@ -3342,7 +3449,7 @@ void *thread_process(void *vargp)	{
 															keyfound.ModMulK1order(&lambda);
 															publickey = secp->ComputePublicKey(&keyfound);
 															generate_binaddress_eth(publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-															if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+															if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																keyfound.Neg();
 																keyfound.Add(&secp->order);
 															}
@@ -3352,7 +3459,7 @@ void *thread_process(void *vargp)	{
 															keyfound.ModMulK1order(&lambda2);
 															publickey = secp->ComputePublicKey(&keyfound);
 															generate_binaddress_eth(publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-															if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+															if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 																keyfound.Neg();
 																keyfound.Add(&secp->order);
 															}
@@ -3812,7 +3919,7 @@ void *thread_process_vanity(void *vargp)	{
 										
 										publickey = secp->ComputePublicKey(&keyfound);
 										secp->GetHash160(P2PKH,true,publickey,(uint8_t*)publickeyhashrmd160);
-										if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160,20) != 0){
+										if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160) != 0){
 											keyfound.Neg();
 											keyfound.Add(&secp->order);
 											//if(FLAGDEBUG) printf("[D] Key need to be negated\n");
@@ -3840,7 +3947,7 @@ void *thread_process_vanity(void *vargp)	{
 											case 7:
 												publickey = secp->ComputePublicKey(&keyfound);
 												secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-												if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+												if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 													keyfound.Neg();
 													keyfound.Add(&secp->order);
 												}
@@ -3850,7 +3957,7 @@ void *thread_process_vanity(void *vargp)	{
 												keyfound.ModMulK1order(&lambda);
 												publickey = secp->ComputePublicKey(&keyfound);
 												secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-												if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+												if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 													keyfound.Neg();
 													keyfound.Add(&secp->order);
 												}
@@ -3860,7 +3967,7 @@ void *thread_process_vanity(void *vargp)	{
 												keyfound.ModMulK1order(&lambda2);
 												publickey = secp->ComputePublicKey(&keyfound);
 												secp->GetHash160(P2PKH,false,publickey,(uint8_t*)publickeyhashrmd160_uncompress[0]);
-												if(memcmp(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0],20) != 0){
+												if(compare20(publickeyhashrmd160_endomorphism[l][k],publickeyhashrmd160_uncompress[0]) != 0){
 													keyfound.Neg();
 													keyfound.Add(&secp->order);
 												}
@@ -3951,7 +4058,7 @@ void _insertionsort(struct address_value *arr, int64_t n) {
 	for(i = 1; i < n ; i++ ) {
 		key = arr[i];
 		j= i-1;
-		while(j >= 0 && memcmp(arr[j].value,key.value,20) > 0) {
+		while(j >= 0 && compare20(arr[j].value,key.value) > 0) {
 			arr[j+1] = arr[j];
 			j--;
 		}
@@ -3967,10 +4074,10 @@ int64_t _partition(struct address_value *arr, int64_t n)	{
 	left = 0;
 	right = n-1;
 	do {
-		while(left	< right && memcmp(arr[left].value,pivot.value,20) <= 0 )	{
+		while(left	< right && compare20(arr[left].value,pivot.value) <= 0 )	{
 			left++;
 		}
-		while(right >= left && memcmp(arr[right].value,pivot.value,20) > 0)	{
+		while(right >= left && compare20(arr[right].value,pivot.value) > 0)	{
 			right--;
 		}
 		if(left < right)	{
@@ -3995,9 +4102,9 @@ void _heapify(struct address_value *arr, int64_t n, int64_t i) {
 	int64_t largest = i;
 	int64_t l = 2 * i + 1;
 	int64_t r = 2 * i + 2;
-	if (l < n && memcmp(arr[l].value,arr[largest].value,20) > 0)
+	if (l < n && compare20(arr[l].value,arr[largest].value) > 0)
 		largest = l;
-	if (r < n && memcmp(arr[r].value,arr[largest].value,20) > 0)
+	if (r < n && compare20(arr[r].value,arr[largest].value) > 0)
 		largest = r;
 	if (largest != i) {
 		_swap(&arr[i],&arr[largest]);
@@ -6167,8 +6274,8 @@ bool vanityrmdmatch(unsigned char *rmdhash)	{
 		case 1:
 			for(i = 0; i < vanity_rmd_targets && !r;i++)	{
 				for(j = 0; j < vanity_rmd_limits[i] && !r; j++)	{
-					cmpA = memcmp(vanity_rmd_limit_values_A[i][j],rmdhash,20);
-					cmpB = memcmp(vanity_rmd_limit_values_B[i][j],rmdhash,20);
+					cmpA = compare20(vanity_rmd_limit_values_A[i][j],rmdhash);
+					cmpB = compare20(vanity_rmd_limit_values_B[i][j],rmdhash);
 					if(cmpA <= 0 && cmpB >= 0)	{
 						//if(FLAGDEBUG ) printf("\n\n[D] cmpA = %i, cmpB = %i \n\n",cmpA,cmpB);
 						r = true;

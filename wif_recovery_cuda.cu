@@ -429,6 +429,25 @@ static int launch_progress_blocks() {
     return 1024;
 }
 
+static uint64_t h_pow58_u64(int exp) {
+    uint64_t value = 1;
+    for (int i = 0; i < exp; i++) value *= 58ULL;
+    return value;
+}
+
+static uint64_t h_bsgs_table_slots(uint64_t combinations) {
+    uint64_t min_table_size = combinations + (combinations / 2);
+    uint64_t table_size = 2;
+    while (table_size < min_table_size) table_size <<= 1;
+    return table_size;
+}
+
+static size_t h_bsgs_table_bytes_for_split(int table_chars) {
+    uint64_t combinations = h_pow58_u64(table_chars);
+    uint64_t slots = h_bsgs_table_slots(combinations);
+    return (size_t)slots * sizeof(GpuBsgsEntry);
+}
+
 extern "C" int cuda_wif_recovery_bsgs(
     const char* partial_wif,
     const int* missing_positions,
@@ -463,6 +482,10 @@ extern "C" int cuda_wif_recovery_bsgs(
     }
     if (report_cuda_error(cudaSetDevice(0), "set device") != 0) return -1;
 
+    size_t cuda_free_mem = 0;
+    size_t cuda_total_mem = 0;
+    bool have_cuda_mem_info = cudaMemGetInfo(&cuda_free_mem, &cuda_total_mem) == cudaSuccess;
+
     int wif_len = (int)strlen(partial_wif);
     if (wif_len <= 0 || wif_len >= 64) {
         fprintf(stderr, "[E] Invalid WIF length for CUDA BSGS recovery: %d\n", wif_len);
@@ -489,8 +512,18 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
     }
 
-    int num_b = num_missing / 2;
-    if (num_b > 5) num_b = 5;
+    int desired_num_b = num_missing / 2;
+    if (desired_num_b > 5) desired_num_b = 5;
+    int num_b = desired_num_b;
+    if (have_cuda_mem_info) {
+        size_t usable_table_mem = (cuda_free_mem * 85ULL) / 100ULL;
+        while (num_b > 0 && h_bsgs_table_bytes_for_split(num_b) > usable_table_mem) {
+            num_b--;
+        }
+        printf("[+] CUDA memory: %.2f GiB free / %.2f GiB total\n",
+            (double)cuda_free_mem / 1073741824.0,
+            (double)cuda_total_mem / 1073741824.0);
+    }
     int num_a = num_missing - num_b;
     if (num_a > 10 || num_b > 5) {
         fprintf(stderr, "[E] CUDA BSGS split is too large: A=%d B=%d\n", num_a, num_b);
@@ -502,8 +535,16 @@ extern "C" int cuda_wif_recovery_bsgs(
     for (int i = 0; i < num_b; i++) h_b_pos[i] = pos_copy[i];
     for (int i = 0; i < num_a; i++) h_a_pos[i] = pos_copy[num_b + i];
 
-    printf("[+] WIF recovery GPU BSGS mode enabled. Missing: %d chars (A=%d, B=%d)\n",
-        num_missing, num_a, num_b);
+    printf("[+] WIF recovery GPU BSGS mode enabled. Missing: %d chars\n", num_missing);
+    printf("[+] BSGS split: table chars=%d, search chars=%d\n", num_b, num_a);
+    if (num_b != desired_num_b) {
+        fprintf(stderr,
+            "[W] GPU memory is not enough for the balanced %d/%d split; using lower-memory %d/%d split. This avoids OOM but is slower.\n",
+            desired_num_b,
+            num_missing - desired_num_b,
+            num_b,
+            num_a);
+    }
 
     Point p_target;
     char pubhex[132] = {0};
@@ -635,14 +676,10 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
     }
 
-    uint64_t b_combs = 1;
-    for (int i = 0; i < num_b; i++) b_combs *= 58ULL;
-    uint64_t a_combs = 1;
-    for (int i = 0; i < num_a; i++) a_combs *= 58ULL;
+    uint64_t b_combs = h_pow58_u64(num_b);
+    uint64_t a_combs = h_pow58_u64(num_a);
 
-    uint64_t min_table_size = b_combs + (b_combs / 2);
-    uint64_t table_size64 = 2;
-    while (table_size64 < min_table_size) table_size64 <<= 1;
+    uint64_t table_size64 = h_bsgs_table_slots(b_combs);
     if (table_size64 > UINT32_MAX) {
         fprintf(stderr, "[E] CUDA BSGS table is too large for 32-bit indexing: %" PRIu64 " slots\n", table_size64);
         return -3;
@@ -653,7 +690,7 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     printf("[+] CUDA BSGS hash table: %u slots, %.2f GiB\n",
         table_size, (double)table_bytes / 1073741824.0);
-    printf("[+] CUDA BSGS combinations: B=%" PRIu64 ", A=%" PRIu64 "\n", b_combs, a_combs);
+    printf("[+] CUDA BSGS combinations: table=%" PRIu64 ", search=%" PRIu64 "\n", b_combs, a_combs);
 
     GpuPointRaw *d_p_missing_b = NULL;
     GpuPointRaw *d_p_missing_a = NULL;

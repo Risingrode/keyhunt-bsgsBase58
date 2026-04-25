@@ -378,17 +378,12 @@ extern "C" int cuda_wif_recovery(
     
     // Calculate total combinations
     uint64_t total_combinations = 1;
-    const uint64_t max_combinations = 1000000000000ULL;
     for (int i = 0; i < num_missing; i++) {
-        if (total_combinations > max_combinations / 58) {
-            fprintf(stderr, "[E] Too many combinations. Max ~10^12\n");
+        if (total_combinations > UINT64_MAX / 58ULL) {
+            fprintf(stderr, "[E] Too many combinations for 64-bit CUDA indexing\n");
             return -2;
         }
-        total_combinations *= 58;
-        if (total_combinations > max_combinations) {
-            fprintf(stderr, "[E] Too many combinations (%" PRIu64 "). Max ~10^12\n", total_combinations);
-            return -2;
-        }
+        total_combinations *= 58ULL;
     }
     
     printf("[+] Total combinations: %" PRIu64 "\n", total_combinations);
@@ -403,11 +398,12 @@ extern "C" int cuda_wif_recovery(
     int zero = 0;
     int threads_per_block = 256;
     int blocks = 1024;
-    int h_result_count = 0;
-    int results_to_copy = 0;
     int match_found = 0;
     int rc = -1;
-    uint64_t combinations_per_thread = 0;
+    const uint64_t combinations_per_thread = 262144ULL;
+    uint64_t combinations_per_launch = 0;
+    uint64_t launch_start = 0;
+    uint64_t launch_index = 0;
     result_wif[0] = '\0';
 
     if (report_cuda_error(cudaMalloc((void**)&d_partial_wif, wif_len + 1), "allocate partial WIF") != 0) goto cleanup;
@@ -419,64 +415,80 @@ extern "C" int cuda_wif_recovery(
     if (report_cuda_error(cudaMemcpy(d_partial_wif, partial_wif, wif_len + 1, cudaMemcpyHostToDevice), "copy partial WIF") != 0) goto cleanup;
     if (report_cuda_error(cudaMemcpy(d_missing_positions, missing_positions, num_missing * sizeof(int), cudaMemcpyHostToDevice), "copy missing positions") != 0) goto cleanup;
     
-    if (report_cuda_error(cudaMemcpy(d_result_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear result count") != 0) goto cleanup;
-    
-    // Configure kernel launch
-    combinations_per_thread = (total_combinations + (blocks * threads_per_block) - 1) / (blocks * threads_per_block);
-    
-    printf("[+] Launching kernel: %d blocks, %d threads\n", blocks, threads_per_block);
+    // Configure kernel launch. Keep each launch bounded so large WIF gaps
+    // such as 58^8 are processed in batches instead of being rejected.
+    combinations_per_launch = (uint64_t)blocks * (uint64_t)threads_per_block * combinations_per_thread;
+
+    printf("[+] Launching CUDA batches: %d blocks, %d threads\n", blocks, threads_per_block);
     printf("[+] Combinations per thread: %" PRIu64 "\n", combinations_per_thread);
-    
-    // Launch kernel
-    wif_recovery_kernel<<<blocks, threads_per_block>>>(
-        d_partial_wif,
-        wif_len,
-        d_missing_positions,
-        num_missing,
-        compressed,
-        0, // start_index
-        total_combinations,
-        combinations_per_thread,
-        d_results,
-        d_result_count
-    );
-    
-    if (report_cuda_error(cudaGetLastError(), "launch WIF recovery kernel") != 0) goto cleanup;
-    if (report_cuda_error(cudaDeviceSynchronize(), "synchronize WIF recovery kernel") != 0) goto cleanup;
-    
-    // Check results
-    if (report_cuda_error(cudaMemcpy(&h_result_count, d_result_count, sizeof(int), cudaMemcpyDeviceToHost), "copy result count") != 0) goto cleanup;
-    
-    results_to_copy = (h_result_count > max_results) ? max_results : h_result_count;
-    if (h_result_count > max_results) {
-        fprintf(stderr, "[W] CUDA found %d checksum candidates; verifying the first %d\n", h_result_count, max_results);
-    }
-    h_results = (WIFResult*)malloc(results_to_copy * sizeof(WIFResult));
-    if (results_to_copy > 0 && h_results == NULL) {
+    printf("[+] Combinations per CUDA batch: %" PRIu64 "\n", combinations_per_launch);
+
+    h_results = (WIFResult*)malloc(max_results * sizeof(WIFResult));
+    if (h_results == NULL) {
         fprintf(stderr, "[E] Failed to allocate host result buffer\n");
         goto cleanup;
     }
-    
-    if (results_to_copy > 0) {
-        if (report_cuda_error(cudaMemcpy(h_results, d_results, results_to_copy * sizeof(WIFResult), cudaMemcpyDeviceToHost), "copy WIF candidates") != 0) {
+
+    for (launch_start = 0; launch_start < total_combinations; launch_start += combinations_per_launch, launch_index++) {
+        int h_result_count = 0;
+        int results_to_copy = 0;
+
+        if (report_cuda_error(cudaMemcpy(d_result_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear result count") != 0) goto cleanup;
+
+        wif_recovery_kernel<<<blocks, threads_per_block>>>(
+            d_partial_wif,
+            wif_len,
+            d_missing_positions,
+            num_missing,
+            compressed,
+            launch_start,
+            total_combinations,
+            combinations_per_thread,
+            d_results,
+            d_result_count
+        );
+
+        if (report_cuda_error(cudaGetLastError(), "launch WIF recovery kernel") != 0) goto cleanup;
+        if (report_cuda_error(cudaDeviceSynchronize(), "synchronize WIF recovery kernel") != 0) goto cleanup;
+
+        if (report_cuda_error(cudaMemcpy(&h_result_count, d_result_count, sizeof(int), cudaMemcpyDeviceToHost), "copy result count") != 0) goto cleanup;
+
+        results_to_copy = (h_result_count > max_results) ? max_results : h_result_count;
+        if (h_result_count > max_results) {
+            fprintf(stderr, "[W] CUDA batch %" PRIu64 " found %d checksum candidates; verifying the first %d\n",
+                launch_index, h_result_count, max_results);
+        }
+
+        if (results_to_copy > 0) {
+            if (report_cuda_error(cudaMemcpy(h_results, d_results, results_to_copy * sizeof(WIFResult), cudaMemcpyDeviceToHost), "copy WIF candidates") != 0) {
+                goto cleanup;
+            }
+        }
+
+        if (h_result_count > 0) {
+            printf("[+] GPU batch %" PRIu64 " found %d valid WIF checksum candidates. Verifying public keys...\n",
+                launch_index, h_result_count);
+        }
+
+        for(int i = 0; i < results_to_copy; i++) {
+            if(verify_privkey_pubkey(h_results[i].privkey, target_pubkey, target_pubkey_len, compressed)) {
+                strcpy(result_wif, h_results[i].wif);
+                printf("[+] WIF exact match found: %s\n", result_wif);
+                match_found = 1;
+                break;
+            }
+        }
+
+        if (match_found) {
+            rc = 0;
             goto cleanup;
         }
-    }
 
-    printf("[+] GPU found %d valid WIF checksum candidates. Verifying public keys...\n", h_result_count);
-    
-    for(int i = 0; i < results_to_copy; i++) {
-        if(verify_privkey_pubkey(h_results[i].privkey, target_pubkey, target_pubkey_len, compressed)) {
-            strcpy(result_wif, h_results[i].wif);
-            printf("[+] WIF exact match found: %s\n", result_wif);
-            match_found = 1;
-            break;
+        if ((launch_index % 16ULL) == 15ULL) {
+            uint64_t processed = launch_start + combinations_per_launch;
+            if (processed > total_combinations) processed = total_combinations;
+            printf("[+] CUDA progress: %" PRIu64 "/%" PRIu64 " combinations\n", processed, total_combinations);
         }
-    }
-
-    if (match_found) {
-        rc = 0;
-        goto cleanup;
     }
     
     printf("[-] No match found\n");

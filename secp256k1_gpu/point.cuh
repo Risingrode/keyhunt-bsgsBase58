@@ -4,9 +4,10 @@
 #include "field.cuh"
 
 /*
- * point.cuh — secp256k1 椭圆曲线 Jacobian 坐标点运算
+ * point.cuh — secp256k1 椭圆曲线投影坐标点运算
  *
- * Jacobian 坐标 (X, Y, Z) 对应仿射坐标 (x, y) = (X/Z^2, Y/Z^3)
+ * 本项目 CPU secp256k1 实现使用 homogeneous/projective 坐标:
+ * (X, Y, Z) 对应仿射坐标 (x, y) = (X/Z, Y/Z)
  * 当 Z = 0 时表示无穷远点（单位元）
  * secp256k1 曲线参数: a = 0, b = 7
  */
@@ -33,7 +34,7 @@ struct ECPoint {
 /* ==================== 生成元 G ==================== */
 
 /*
- * 返回 secp256k1 生成元 G 的 Jacobian 坐标 (Z=1)
+ * 返回 secp256k1 生成元 G 的投影坐标 (Z=1)
  *
  * 生成元仿射坐标:
  *   G.x = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
@@ -54,9 +55,9 @@ __device__ __forceinline__ ECPoint get_generator() {
 /* ==================== 点取反 ==================== */
 
 /*
- * 返回 -P = (X, -Y mod p, Z) 在 Jacobian 坐标下
+ * 返回 -P = (X, -Y mod p, Z) 在投影坐标下
  * 仿射取反: (x, y) → (x, p - y)
- * Jacobian: (X, Y, Z) → (X, p - Y, Z)，因为 -(Y/Z³) = (p-Y)/Z³
+ * Projective: (X, Y, Z) → (X, p - Y, Z)，因为 -(Y/Z) = (p-Y)/Z
  */
 __device__ __forceinline__ ECPoint point_neg(const ECPoint& P) {
     ECPoint result;
@@ -69,7 +70,7 @@ __device__ __forceinline__ ECPoint point_neg(const ECPoint& P) {
 /* ==================== 点倍乘 (secp256k1 a=0) ==================== */
 
 /*
- * Jacobian 点倍乘: R = 2P
+ * 投影坐标点倍乘: R = 2P
  *
  * secp256k1 曲线 a = 0，简化公式:
  *   如果 Y == 0: 返回无穷远点
@@ -136,14 +137,14 @@ __device__ ECPoint point_double(const ECPoint& P) {
     return R;
 }
 
-/* ==================== Jacobian + Jacobian 点加法 ==================== */
+/* ==================== 投影坐标点加法 ==================== */
 
 /*
- * Jacobian 点加法: R = P + Q
+ * 投影坐标点加法: R = P + Q
  *
  * 公式 (当 P≠Q, P≠∞, Q≠∞):
- *   U1 = Y2 * Z1²        U2 = Y1 * Z2²
- *   V1 = X2 * Z1³        V2 = X1 * Z2³
+ *   U1 = Y2 * Z1         U2 = Y1 * Z2
+ *   V1 = X2 * Z1         V2 = X1 * Z2
  *   如果 V1 == V2:
  *     U1 == U2 → 返回 point_double(P) (同一点)
  *     U1 != U2 → 返回无穷远点 (互为逆元)
@@ -160,17 +161,11 @@ __device__ ECPoint point_add(const ECPoint& P, const ECPoint& Q) {
     if (P.is_infinity()) return Q;
     if (Q.is_infinity()) return P;
 
-    /* 预计算 Z 的幂 */
-    uint256 z1_sq = field_sqr(P.z);             /* Z1² */
-    uint256 z2_sq = field_sqr(Q.z);             /* Z2² */
-    uint256 z1_cb = field_mul(z1_sq, P.z);      /* Z1³ */
-    uint256 z2_cb = field_mul(z2_sq, Q.z);      /* Z2³ */
-
     /* 计算 U1, U2, V1, V2 */
-    uint256 u1 = field_mul(Q.y, z1_sq);         /* U1 = Y2 * Z1² */
-    uint256 u2 = field_mul(P.y, z2_sq);         /* U2 = Y1 * Z2² */
-    uint256 v1 = field_mul(Q.x, z1_cb);         /* V1 = X2 * Z1³ */
-    uint256 v2 = field_mul(P.x, z2_cb);         /* V2 = X1 * Z2³ */
+    uint256 u1 = field_mul(Q.y, P.z);           /* U1 = Y2 * Z1 */
+    uint256 u2 = field_mul(P.y, Q.z);           /* U2 = Y1 * Z2 */
+    uint256 v1 = field_mul(Q.x, P.z);           /* V1 = X2 * Z1 */
+    uint256 v2 = field_mul(P.x, Q.z);           /* V2 = X1 * Z2 */
 
     /* V1 == V2: 两点 x 坐标相同 */
     if (v1.is_equal(v2)) {
@@ -216,17 +211,17 @@ __device__ ECPoint point_add(const ECPoint& P, const ECPoint& Q) {
     return R;
 }
 
-/* ==================== Jacobian + Affine 混合加法 ==================== */
+/* ==================== 投影坐标 + Affine 混合加法 ==================== */
 
 /*
  * 混合点加法: R = P + Q，其中 Q.z == 1（Q 为仿射坐标）
- * 比通用 Jacobian 加法更高效，少几次乘法
+ * 比通用投影坐标加法更高效，少几次乘法
  *
  * 当 Z2 = 1 时简化:
- *   U2 = Y1 (Z2²=1)
- *   V2 = X1 (Z2³=1)
- *   U1 = Y2 * Z1²
- *   V1 = X2 * Z1³
+ *   U2 = Y1
+ *   V2 = X1
+ *   U1 = Y2 * Z1
+ *   V1 = X2 * Z1
  */
 __device__ ECPoint point_add_affine(const ECPoint& P, const ECPoint& Q) {
     /* 处理无穷远点 */
@@ -236,12 +231,9 @@ __device__ ECPoint point_add_affine(const ECPoint& P, const ECPoint& Q) {
     /* 当 Q.z == 1 时的优化路径 */
     if (Q.z.is_equal(UINT256_ONE)) {
         /* Z2 = 1，简化计算 */
-        uint256 z1_sq = field_sqr(P.z);           /* Z1² */
-        uint256 z1_cb = field_mul(z1_sq, P.z);    /* Z1³ */
-
-        uint256 u1 = field_mul(Q.y, z1_sq);       /* U1 = Y2 * Z1² */
+        uint256 u1 = field_mul(Q.y, P.z);         /* U1 = Y2 * Z1 */
         uint256 u2 = P.y;                          /* U2 = Y1 (Z2=1) */
-        uint256 v1 = field_mul(Q.x, z1_cb);       /* V1 = X2 * Z1³ */
+        uint256 v1 = field_mul(Q.x, P.z);         /* V1 = X2 * Z1 */
         uint256 v2 = P.x;                          /* V2 = X1 (Z2=1) */
 
         if (v1.is_equal(v2)) {
@@ -286,12 +278,12 @@ __device__ ECPoint point_add_affine(const ECPoint& P, const ECPoint& Q) {
     return point_add(P, Q);
 }
 
-/* ==================== 仿射化 (Jacobian → Affine) ==================== */
+/* ==================== 仿射化 (Projective → Affine) ==================== */
 
 /*
- * 将 Jacobian 坐标点 P 转换为仿射坐标
- * x_affine = X * Z_inv²
- * y_affine = Y * Z_inv³
+ * 将投影坐标点 P 转换为仿射坐标
+ * x_affine = X * Z_inv
+ * y_affine = Y * Z_inv
  * 结果的 z 坐标设为 1
  */
 __device__ ECPoint point_reduce(const ECPoint& P) {
@@ -301,13 +293,11 @@ __device__ ECPoint point_reduce(const ECPoint& P) {
         return inf;
     }
 
-    uint256 z_inv  = field_inv(P.z);         /* Z⁻¹ */
-    uint256 z_inv2 = field_sqr(z_inv);       /* Z⁻² */
-    uint256 z_inv3 = field_mul(z_inv2, z_inv); /* Z⁻³ */
+    uint256 z_inv = field_inv(P.z);          /* Z⁻¹ */
 
     ECPoint result;
-    result.x = field_mul(P.x, z_inv2);       /* x = X / Z² */
-    result.y = field_mul(P.y, z_inv3);       /* y = Y / Z³ */
+    result.x = field_mul(P.x, z_inv);        /* x = X / Z */
+    result.y = field_mul(P.y, z_inv);        /* y = Y / Z */
     result.z = UINT256_ONE;                   /* 仿射坐标 Z = 1 */
     return result;
 }
@@ -315,8 +305,8 @@ __device__ ECPoint point_reduce(const ECPoint& P) {
 /* ==================== 点比较 ==================== */
 
 /*
- * 比较两个 Jacobian 坐标点是否表示同一个仿射点
- * 条件: X1*Z2² == X2*Z1² 且 Y1*Z2³ == Y2*Z1³
+ * 比较两个投影坐标点是否表示同一个仿射点
+ * 条件: X1*Z2 == X2*Z1 且 Y1*Z2 == Y2*Z1
  */
 __device__ bool point_equal(const ECPoint& P, const ECPoint& Q) {
     /* 两个都是无穷远点 */
@@ -324,25 +314,21 @@ __device__ bool point_equal(const ECPoint& P, const ECPoint& Q) {
     /* 一个是无穷远点，另一个不是 */
     if (P.is_infinity() || Q.is_infinity()) return false;
 
-    /* 比较 X 坐标: X1 * Z2² == X2 * Z1² */
-    uint256 z1_sq = field_sqr(P.z);
-    uint256 z2_sq = field_sqr(Q.z);
-    uint256 lhs_x = field_mul(P.x, z2_sq);
-    uint256 rhs_x = field_mul(Q.x, z1_sq);
+    /* 比较 X 坐标: X1 * Z2 == X2 * Z1 */
+    uint256 lhs_x = field_mul(P.x, Q.z);
+    uint256 rhs_x = field_mul(Q.x, P.z);
     if (!lhs_x.is_equal(rhs_x)) return false;
 
-    /* 比较 Y 坐标: Y1 * Z2³ == Y2 * Z1³ */
-    uint256 z1_cb = field_mul(z1_sq, P.z);
-    uint256 z2_cb = field_mul(z2_sq, Q.z);
-    uint256 lhs_y = field_mul(P.y, z2_cb);
-    uint256 rhs_y = field_mul(Q.y, z1_cb);
+    /* 比较 Y 坐标: Y1 * Z2 == Y2 * Z1 */
+    uint256 lhs_y = field_mul(P.y, Q.z);
+    uint256 rhs_y = field_mul(Q.y, P.z);
     return lhs_y.is_equal(rhs_y);
 }
 
 /* ==================== 从仿射坐标构造 ==================== */
 
 /*
- * 从仿射坐标 (x, y) 创建 Jacobian 坐标点，Z = 1
+ * 从仿射坐标 (x, y) 创建投影坐标点，Z = 1
  */
 __device__ __forceinline__ ECPoint point_from_affine(const uint256& x, const uint256& y) {
     ECPoint P;

@@ -34,6 +34,11 @@ if grep -q 'static Point h_compute_c_g' wif_recovery_cuda.cu; then
     exit 1
 fi
 
+if grep -Eq 'Jacobian|z_inv2|z_inv3|Z1²|Z1³|Z2²|Z2³|X / Z²|Y / Z³' secp256k1_gpu/point.cuh; then
+    echo "[FAIL] CUDA secp256k1 point math must stay in projective coordinates matching the CPU implementation" >&2
+    exit 1
+fi
+
 if awk '
     /goto cleanup_bsgs/ { seen_goto = 1 }
     /^cleanup_bsgs:/ { seen_goto = 0 }

@@ -120,6 +120,20 @@ struct GpuBsgsMatch {
     uint32_t carry;
 };
 
+struct GpuBsgsBProbe {
+    uint64_t x_prefix;
+    uint32_t c_value;
+    uint32_t packed;
+    int found;
+};
+
+struct GpuBsgsAProbe {
+    uint64_t combo;
+    uint64_t x_prefix[3];
+    uint32_t c_value;
+    uint64_t packed;
+};
+
 static int h_base58_value(char c) {
     for (int i = 0; i < 58; i++) {
         if (h_base58[i] == c) return i;
@@ -214,6 +228,25 @@ static Point h_multiply_g(Int &scalar) {
     return secp->ComputePublicKey(&scalar);
 }
 
+static uint64_t h_point_x_prefix(Point p) {
+    if (h_point_is_infinity(p)) return 1ULL;
+    p.Reduce();
+    uint64_t x = p.x.bits64[0];
+    return x == 0 ? 1ULL : x;
+}
+
+static Point h_lookup_c_g_from_table(uint32_t c, Point table[4][256]) {
+    Point p;
+    p.Clear();
+    for (int i = 0; i < 4; i++) {
+        uint8_t byte = (c >> (i * 8)) & 0xFF;
+        if (byte != 0) {
+            p = h_point_add(p, table[i][byte]);
+        }
+    }
+    return p;
+}
+
 static GpuPointRaw h_point_to_raw(Point p) {
     GpuPointRaw out;
     if (h_point_is_infinity(p)) {
@@ -227,6 +260,98 @@ static GpuPointRaw h_point_to_raw(Point p) {
         out.z.v[i] = (i == 0) ? 1ULL : 0ULL;
     }
     return out;
+}
+
+static void h_decode_combo_point(
+    uint64_t combo,
+    const std::vector<Point> &points,
+    const int *positions,
+    int num_positions,
+    int wif_len,
+    const uint32_t *pow58_mod32,
+    Point *sum_p,
+    uint32_t *sum_c,
+    uint64_t *packed
+) {
+    Point p;
+    p.Clear();
+    uint32_t c = 0;
+    uint64_t bits = 0;
+    uint64_t temp = combo;
+
+    for (int i = 0; i < num_positions; i++) {
+        int d = (int)(temp % 58ULL);
+        temp /= 58ULL;
+        if (d > 0) {
+            Point addend = points[((size_t)i * 58) + d];
+            p = h_point_add(p, addend);
+        }
+        c += (uint32_t)d * pow58_mod32[wif_len - 1 - positions[i]];
+        bits |= ((uint64_t)d << (6 * i));
+    }
+
+    *sum_p = p;
+    *sum_c = c;
+    *packed = bits;
+}
+
+static void h_make_b_probe(
+    uint64_t combo,
+    const std::vector<Point> &points,
+    const int *positions,
+    int num_positions,
+    int wif_len,
+    const uint32_t *pow58_mod32,
+    Point table[4][256],
+    GpuBsgsBProbe *probe
+) {
+    Point sum_p;
+    uint32_t sum_c = 0;
+    uint64_t packed = 0;
+    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, &sum_p, &sum_c, &packed);
+
+    Point c_p = h_lookup_c_g_from_table(sum_c, table);
+    c_p = h_point_neg(c_p);
+    Point p_b = h_point_add(sum_p, c_p);
+
+    probe->x_prefix = h_point_x_prefix(p_b);
+    probe->c_value = sum_c;
+    probe->packed = (uint32_t)packed;
+    probe->found = 0;
+}
+
+static void h_make_a_probe(
+    uint64_t combo,
+    const std::vector<Point> &points,
+    const int *positions,
+    int num_positions,
+    int wif_len,
+    const uint32_t *pow58_mod32,
+    Point table[4][256],
+    Point base_point,
+    Point g_s,
+    GpuBsgsAProbe *probe
+) {
+    Point sum_p;
+    uint32_t sum_c = 0;
+    uint64_t packed = 0;
+    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, &sum_p, &sum_c, &packed);
+
+    Point c_p = h_lookup_c_g_from_table(sum_c, table);
+    c_p = h_point_neg(c_p);
+    Point p_a = h_point_add(sum_p, c_p);
+    Point neg_pa = h_point_neg(p_a);
+    Point target = h_point_add(base_point, neg_pa);
+
+    probe->combo = combo;
+    probe->c_value = sum_c;
+    probe->packed = packed;
+    for (uint32_t carry = 0; carry <= 2; carry++) {
+        if (carry > 0) {
+            target = h_point_add(target, g_s);
+        }
+        probe->x_prefix[carry] = h_point_x_prefix(target);
+    }
 }
 
 static bool h_build_candidate_wif(
@@ -422,6 +547,82 @@ __global__ void wif_bsgs_search_a_kernel(
                 idx = (idx + 1) & table_mask;
             }
         }
+    }
+}
+
+__global__ void wif_bsgs_probe_b_table_kernel(
+    GpuBsgsBProbe *probes,
+    int num_probes,
+    const GpuBsgsEntry *table,
+    uint32_t table_mask
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_probes) return;
+
+    uint64_t x_prefix = probes[i].x_prefix;
+    uint32_t idx = (uint32_t)x_prefix & table_mask;
+    int found = 0;
+
+    while (table[idx].x_prefix != 0) {
+        if (table[idx].x_prefix == x_prefix &&
+            table[idx].c_value == probes[i].c_value &&
+            table[idx].packed == probes[i].packed) {
+            found = 1;
+            break;
+        }
+        idx = (idx + 1) & table_mask;
+    }
+
+    probes[i].found = found;
+}
+
+__global__ void wif_bsgs_probe_a_kernel(
+    GpuBsgsAProbe *probes,
+    int num_probes,
+    const GpuPointRaw *p_missing_a,
+    const int *a_pos,
+    int num_a,
+    int wif_len,
+    const uint32_t *pow58_mod32,
+    const GpuPointRaw *t_g,
+    GpuPointRaw base_point_raw,
+    GpuPointRaw g_s_raw
+) {
+    int probe_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (probe_idx >= num_probes) return;
+
+    uint64_t combo = probes[probe_idx].combo;
+    ECPoint base_point = raw_to_point(base_point_raw);
+    ECPoint g_s = raw_to_point(g_s_raw);
+    ECPoint sum_p;
+    sum_p.set_infinity();
+    uint32_t sum_c = 0;
+    uint64_t packed = 0;
+    uint64_t temp = combo;
+
+    for (int i = 0; i < num_a; i++) {
+        int d = (int)(temp % 58ULL);
+        temp /= 58ULL;
+        if (d > 0) {
+            sum_p = point_add(sum_p, raw_to_point(p_missing_a[(i * 58) + d]));
+        }
+        sum_c += (uint32_t)d * pow58_mod32[wif_len - 1 - a_pos[i]];
+        packed |= ((uint64_t)d << (6 * i));
+    }
+
+    ECPoint c_p = device_compute_c_g(sum_c, t_g);
+    c_p = point_neg(c_p);
+    ECPoint p_a = point_add(sum_p, c_p);
+    ECPoint neg_pa = point_neg(p_a);
+    ECPoint target = point_add(base_point, neg_pa);
+
+    probes[probe_idx].c_value = sum_c;
+    probes[probe_idx].packed = packed;
+    for (uint32_t carry = 0; carry <= 2; carry++) {
+        if (carry > 0) {
+            target = point_add(target, g_s);
+        }
+        probes[probe_idx].x_prefix[carry] = device_point_x_prefix(target);
     }
 }
 
@@ -637,6 +838,8 @@ extern "C" int cuda_wif_recovery_bsgs(
     size_t a_points_count = num_a > 0 ? (size_t)num_a * 58 : 1;
     std::vector<GpuPointRaw> h_p_missing_b(b_points_count);
     std::vector<GpuPointRaw> h_p_missing_a(a_points_count);
+    std::vector<Point> h_p_missing_b_points(b_points_count);
+    std::vector<Point> h_p_missing_a_points(a_points_count);
 
     for (int i = 0; i < num_b; i++) {
         Int exp(1);
@@ -647,12 +850,14 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         Point zero;
         zero.Clear();
+        h_p_missing_b_points[(size_t)i * 58] = zero;
         h_p_missing_b[(size_t)i * 58] = h_point_to_raw(zero);
         for (int d = 1; d < 58; d++) {
             Int digit_exp(&exp);
             digit_exp.Mult((uint64_t)d);
             digit_exp.Mod(&secp->order);
             Point p_d = h_multiply_g(digit_exp);
+            h_p_missing_b_points[((size_t)i * 58) + d] = p_d;
             h_p_missing_b[((size_t)i * 58) + d] = h_point_to_raw(p_d);
         }
     }
@@ -666,18 +871,49 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         Point zero;
         zero.Clear();
+        h_p_missing_a_points[(size_t)i * 58] = zero;
         h_p_missing_a[(size_t)i * 58] = h_point_to_raw(zero);
         for (int d = 1; d < 58; d++) {
             Int digit_exp(&exp);
             digit_exp.Mult((uint64_t)d);
             digit_exp.Mod(&secp->order);
             Point p_d = h_multiply_g(digit_exp);
+            h_p_missing_a_points[((size_t)i * 58) + d] = p_d;
             h_p_missing_a[((size_t)i * 58) + d] = h_point_to_raw(p_d);
         }
     }
 
     uint64_t b_combs = h_pow58_u64(num_b);
     uint64_t a_combs = h_pow58_u64(num_a);
+
+    uint64_t b_probe_combos[5] = {0, 1, 57, b_combs / 2, b_combs > 0 ? b_combs - 1 : 0};
+    uint64_t a_probe_combos[5] = {0, 1, 57, a_combs / 2, a_combs > 0 ? a_combs - 1 : 0};
+    std::vector<GpuBsgsBProbe> h_b_probes;
+    std::vector<GpuBsgsAProbe> h_a_expected_probes;
+    std::vector<GpuBsgsAProbe> h_a_device_probes;
+    for (int i = 0; i < 5; i++) {
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (b_probe_combos[i] == b_probe_combos[j]) duplicate = true;
+        }
+        if (!duplicate && b_probe_combos[i] < b_combs) {
+            GpuBsgsBProbe probe;
+            h_make_b_probe(b_probe_combos[i], h_p_missing_b_points, h_b_pos, num_b, wif_len, h_pow58_mod32, h_t_g, &probe);
+            h_b_probes.push_back(probe);
+        }
+    }
+    for (int i = 0; i < 5; i++) {
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (a_probe_combos[i] == a_probe_combos[j]) duplicate = true;
+        }
+        if (!duplicate && a_probe_combos[i] < a_combs) {
+            GpuBsgsAProbe probe;
+            h_make_a_probe(a_probe_combos[i], h_p_missing_a_points, h_a_pos, num_a, wif_len, h_pow58_mod32, h_t_g, base_point, g_s, &probe);
+            h_a_expected_probes.push_back(probe);
+            h_a_device_probes.push_back(probe);
+        }
+    }
 
     uint64_t table_size64 = h_bsgs_table_slots(b_combs);
     if (table_size64 > UINT32_MAX) {
@@ -701,6 +937,8 @@ extern "C" int cuda_wif_recovery_bsgs(
     GpuBsgsEntry *d_table = NULL;
     GpuBsgsMatch *d_matches = NULL;
     int *d_match_count = NULL;
+    GpuBsgsBProbe *d_b_probes = NULL;
+    GpuBsgsAProbe *d_a_probes = NULL;
     GpuBsgsMatch *h_matches = NULL;
     int zero = 0;
     int max_matches = 4096;
@@ -749,6 +987,80 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS B kernel") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS B kernel") != 0) goto cleanup_bsgs;
     print_cuda_progress(b_combs, b_combs, 0, 1, started_at, "finished BSGS B");
+
+    if (!h_b_probes.empty()) {
+        size_t b_probe_bytes = h_b_probes.size() * sizeof(GpuBsgsBProbe);
+        if (report_cuda_error(cudaMalloc((void**)&d_b_probes, b_probe_bytes), "allocate CUDA BSGS B probes") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaMemcpy(d_b_probes, h_b_probes.data(), b_probe_bytes, cudaMemcpyHostToDevice), "copy CUDA BSGS B probes") != 0) goto cleanup_bsgs;
+        wif_bsgs_probe_b_table_kernel<<<1, 32>>>(
+            d_b_probes,
+            (int)h_b_probes.size(),
+            d_table,
+            table_mask
+        );
+        if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS B self-test") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS B self-test") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaMemcpy(h_b_probes.data(), d_b_probes, b_probe_bytes, cudaMemcpyDeviceToHost), "copy CUDA BSGS B self-test") != 0) goto cleanup_bsgs;
+        for (size_t i = 0; i < h_b_probes.size(); i++) {
+            if (h_b_probes[i].found == 0) {
+                fprintf(stderr,
+                    "[E] CUDA BSGS B self-test failed: expected table entry x=%016" PRIx64 " c=%08x packed=%08x was not found\n",
+                    h_b_probes[i].x_prefix,
+                    h_b_probes[i].c_value,
+                    h_b_probes[i].packed);
+                rc = -4;
+                goto cleanup_bsgs;
+            }
+        }
+        printf("[+] CUDA BSGS B self-test passed (%zu probes)\n", h_b_probes.size());
+    }
+
+    if (!h_a_device_probes.empty()) {
+        size_t a_probe_bytes = h_a_device_probes.size() * sizeof(GpuBsgsAProbe);
+        if (report_cuda_error(cudaMalloc((void**)&d_a_probes, a_probe_bytes), "allocate CUDA BSGS A probes") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaMemcpy(d_a_probes, h_a_device_probes.data(), a_probe_bytes, cudaMemcpyHostToDevice), "copy CUDA BSGS A probes") != 0) goto cleanup_bsgs;
+        wif_bsgs_probe_a_kernel<<<1, 32>>>(
+            d_a_probes,
+            (int)h_a_device_probes.size(),
+            d_p_missing_a,
+            d_a_pos,
+            num_a,
+            wif_len,
+            d_pow58_mod32,
+            d_t_g,
+            h_point_to_raw(base_point),
+            h_point_to_raw(g_s)
+        );
+        if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS A self-test") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS A self-test") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaMemcpy(h_a_device_probes.data(), d_a_probes, a_probe_bytes, cudaMemcpyDeviceToHost), "copy CUDA BSGS A self-test") != 0) goto cleanup_bsgs;
+        for (size_t i = 0; i < h_a_device_probes.size(); i++) {
+            if (h_a_device_probes[i].c_value != h_a_expected_probes[i].c_value ||
+                h_a_device_probes[i].packed != h_a_expected_probes[i].packed ||
+                h_a_device_probes[i].x_prefix[0] != h_a_expected_probes[i].x_prefix[0] ||
+                h_a_device_probes[i].x_prefix[1] != h_a_expected_probes[i].x_prefix[1] ||
+                h_a_device_probes[i].x_prefix[2] != h_a_expected_probes[i].x_prefix[2]) {
+                fprintf(stderr,
+                    "[E] CUDA BSGS A self-test failed at combo=%" PRIu64
+                    ": host x=[%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "] c=%08x packed=%" PRIx64
+                    ", device x=[%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "] c=%08x packed=%" PRIx64 "\n",
+                    h_a_expected_probes[i].combo,
+                    h_a_expected_probes[i].x_prefix[0],
+                    h_a_expected_probes[i].x_prefix[1],
+                    h_a_expected_probes[i].x_prefix[2],
+                    h_a_expected_probes[i].c_value,
+                    h_a_expected_probes[i].packed,
+                    h_a_device_probes[i].x_prefix[0],
+                    h_a_device_probes[i].x_prefix[1],
+                    h_a_device_probes[i].x_prefix[2],
+                    h_a_device_probes[i].c_value,
+                    h_a_device_probes[i].packed);
+                rc = -4;
+                goto cleanup_bsgs;
+            }
+        }
+        printf("[+] CUDA BSGS A self-test passed (%zu probes)\n", h_a_device_probes.size());
+    }
 
     printf("[+] CUDA BSGS searching A side on GPU...\n");
     print_cuda_progress(0, a_combs, 0, 1, started_at, "starting BSGS A");
@@ -822,6 +1134,8 @@ cleanup_bsgs:
     if (d_table != NULL) cudaFree(d_table);
     if (d_matches != NULL) cudaFree(d_matches);
     if (d_match_count != NULL) cudaFree(d_match_count);
+    if (d_b_probes != NULL) cudaFree(d_b_probes);
+    if (d_a_probes != NULL) cudaFree(d_a_probes);
     free(h_matches);
     return rc;
 }

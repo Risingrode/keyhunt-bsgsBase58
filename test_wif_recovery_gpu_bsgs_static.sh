@@ -19,6 +19,16 @@ if grep -q 'Combinations per CUDA batch' wif_recovery_cuda.cu; then
     exit 1
 fi
 
+if ! grep -q 'cudaGetDeviceProperties' wif_recovery_cuda.cu || ! grep -q 'h_choose_cuda_blocks' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS must adapt launch settings to the selected GPU" >&2
+    exit 1
+fi
+
+if ! grep -q 'h_choose_table_chars_for_memory' wif_recovery_cuda.cu || ! grep -q 'CUDA memory plan' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS must adapt the BSGS split to available GPU memory" >&2
+    exit 1
+fi
+
 if grep -R -q '\buint256_ONE\b' secp256k1_gpu wif_recovery_cuda.cu; then
     echo "[FAIL] CUDA GPU math uses undefined uint256_ONE instead of UINT256_ONE" >&2
     exit 1

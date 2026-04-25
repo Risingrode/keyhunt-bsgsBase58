@@ -629,8 +629,180 @@ __global__ void wif_bsgs_probe_a_kernel(
     }
 }
 
-static int launch_progress_blocks() {
-    return 1024;
+static uint64_t h_pow58_u64(int exp);
+static uint64_t h_bsgs_table_slots(uint64_t combinations);
+static size_t h_bsgs_table_bytes_for_split(int table_chars);
+
+static uint64_t h_div_ceil_u64(uint64_t value, uint64_t divisor) {
+    return divisor == 0 ? 0 : ((value + divisor - 1) / divisor);
+}
+
+static size_t h_cuda_memory_reserve(size_t free_mem) {
+    const size_t min_reserve = 512ULL * 1024ULL * 1024ULL;
+    size_t proportional_reserve = free_mem / 8ULL;
+    return proportional_reserve > min_reserve ? proportional_reserve : min_reserve;
+}
+
+static size_t h_cuda_bsgs_aux_bytes(int table_chars, int search_chars, int max_matches) {
+    size_t table_points = table_chars > 0 ? (size_t)table_chars * 58ULL : 1ULL;
+    size_t search_points = search_chars > 0 ? (size_t)search_chars * 58ULL : 1ULL;
+    size_t probe_count = 5;
+
+    return
+        table_points * sizeof(GpuPointRaw) +
+        search_points * sizeof(GpuPointRaw) +
+        (4ULL * 256ULL * sizeof(GpuPointRaw)) +
+        (table_chars > 0 ? (size_t)table_chars : 1ULL) * sizeof(int) +
+        (search_chars > 0 ? (size_t)search_chars : 1ULL) * sizeof(int) +
+        64ULL * sizeof(uint32_t) +
+        (size_t)max_matches * sizeof(GpuBsgsMatch) +
+        sizeof(int) +
+        probe_count * sizeof(GpuBsgsBProbe) +
+        probe_count * sizeof(GpuBsgsAProbe);
+}
+
+static int h_choose_table_chars_for_memory(
+    int desired_table_chars,
+    int num_missing,
+    size_t free_mem,
+    size_t *chosen_table_bytes,
+    size_t *chosen_aux_bytes,
+    size_t *chosen_reserve_bytes,
+    int max_matches
+) {
+    size_t reserve = h_cuda_memory_reserve(free_mem);
+    int table_chars = desired_table_chars;
+
+    while (table_chars > 0) {
+        int search_chars = num_missing - table_chars;
+        size_t table_bytes = h_bsgs_table_bytes_for_split(table_chars);
+        size_t aux_bytes = h_cuda_bsgs_aux_bytes(table_chars, search_chars, max_matches);
+        if (table_bytes + aux_bytes + reserve <= free_mem) {
+            if (chosen_table_bytes) *chosen_table_bytes = table_bytes;
+            if (chosen_aux_bytes) *chosen_aux_bytes = aux_bytes;
+            if (chosen_reserve_bytes) *chosen_reserve_bytes = reserve;
+            return table_chars;
+        }
+        table_chars--;
+    }
+
+    if (chosen_table_bytes) *chosen_table_bytes = h_bsgs_table_bytes_for_split(0);
+    if (chosen_aux_bytes) *chosen_aux_bytes = h_cuda_bsgs_aux_bytes(0, num_missing, max_matches);
+    if (chosen_reserve_bytes) *chosen_reserve_bytes = reserve;
+    return 0;
+}
+
+static int h_choose_threads_per_block(const cudaDeviceProp &prop) {
+    if (prop.maxThreadsPerBlock >= 256) return 256;
+    if (prop.maxThreadsPerBlock >= 128) return 128;
+    if (prop.maxThreadsPerBlock >= 64) return 64;
+    return prop.maxThreadsPerBlock > 0 ? prop.maxThreadsPerBlock : 32;
+}
+
+static int h_choose_cuda_blocks(const cudaDeviceProp &prop, uint64_t total, int threads_per_block) {
+    int sm_count = prop.multiProcessorCount > 0 ? prop.multiProcessorCount : 1;
+    uint64_t target_blocks = (uint64_t)sm_count * 16ULL;
+    uint64_t min_blocks = (uint64_t)sm_count * 4ULL;
+    uint64_t max_blocks = (uint64_t)(prop.maxGridSize[0] > 0 ? prop.maxGridSize[0] : 65535);
+    uint64_t needed_blocks = h_div_ceil_u64(total, (uint64_t)threads_per_block);
+
+    if (target_blocks < min_blocks) target_blocks = min_blocks;
+    if (target_blocks > needed_blocks && needed_blocks > 0) target_blocks = needed_blocks;
+    if (target_blocks > max_blocks) target_blocks = max_blocks;
+    if (target_blocks == 0) target_blocks = 1;
+    return (int)target_blocks;
+}
+
+static int h_select_cuda_device(
+    int desired_table_chars,
+    int num_missing,
+    int max_matches,
+    cudaDeviceProp *selected_prop,
+    size_t *selected_free_mem,
+    size_t *selected_total_mem,
+    int *selected_table_chars,
+    size_t *selected_table_bytes,
+    size_t *selected_aux_bytes,
+    size_t *selected_reserve_bytes
+) {
+    int device_count = 0;
+    if (report_cuda_error(cudaGetDeviceCount(&device_count), "device count") != 0) return -1;
+    if (device_count == 0) {
+        fprintf(stderr, "[E] No CUDA devices found\n");
+        return -1;
+    }
+
+    int best_device = -1;
+    int best_table_chars = -1;
+    int best_sm_count = -1;
+    size_t best_free_mem = 0;
+    size_t best_total_mem = 0;
+    size_t best_table_bytes = 0;
+    size_t best_aux_bytes = 0;
+    size_t best_reserve_bytes = 0;
+    cudaDeviceProp best_prop;
+    memset(&best_prop, 0, sizeof(best_prop));
+
+    for (int device = 0; device < device_count; device++) {
+        cudaDeviceProp prop;
+        if (report_cuda_error(cudaGetDeviceProperties(&prop, device), "device properties") != 0) return -1;
+        if (report_cuda_error(cudaSetDevice(device), "set device for memory query") != 0) return -1;
+
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        if (report_cuda_error(cudaMemGetInfo(&free_mem, &total_mem), "memory info") != 0) return -1;
+
+        size_t table_bytes = 0;
+        size_t aux_bytes = 0;
+        size_t reserve_bytes = 0;
+        int table_chars = h_choose_table_chars_for_memory(
+            desired_table_chars,
+            num_missing,
+            free_mem,
+            &table_bytes,
+            &aux_bytes,
+            &reserve_bytes,
+            max_matches
+        );
+
+        bool better = false;
+        if (best_device < 0) {
+            better = true;
+        } else if (table_chars > best_table_chars) {
+            better = true;
+        } else if (table_chars == best_table_chars && prop.multiProcessorCount > best_sm_count) {
+            better = true;
+        } else if (table_chars == best_table_chars && prop.multiProcessorCount == best_sm_count && free_mem > best_free_mem) {
+            better = true;
+        }
+
+        if (better) {
+            best_device = device;
+            best_table_chars = table_chars;
+            best_sm_count = prop.multiProcessorCount;
+            best_free_mem = free_mem;
+            best_total_mem = total_mem;
+            best_table_bytes = table_bytes;
+            best_aux_bytes = aux_bytes;
+            best_reserve_bytes = reserve_bytes;
+            best_prop = prop;
+        }
+    }
+
+    if (best_device < 0) {
+        fprintf(stderr, "[E] Failed to select a CUDA device\n");
+        return -1;
+    }
+    if (report_cuda_error(cudaSetDevice(best_device), "set selected device") != 0) return -1;
+
+    if (selected_prop) *selected_prop = best_prop;
+    if (selected_free_mem) *selected_free_mem = best_free_mem;
+    if (selected_total_mem) *selected_total_mem = best_total_mem;
+    if (selected_table_chars) *selected_table_chars = best_table_chars;
+    if (selected_table_bytes) *selected_table_bytes = best_table_bytes;
+    if (selected_aux_bytes) *selected_aux_bytes = best_aux_bytes;
+    if (selected_reserve_bytes) *selected_reserve_bytes = best_reserve_bytes;
+    return best_device;
 }
 
 static uint64_t h_pow58_u64(int exp) {
@@ -677,18 +849,7 @@ extern "C" int cuda_wif_recovery_bsgs(
         fprintf(stderr, "[E] CUDA BSGS WIF recovery supports 1..10 missing characters in this build\n");
         return -2;
     }
-
-    int device_count = 0;
-    if (report_cuda_error(cudaGetDeviceCount(&device_count), "device count") != 0) return -1;
-    if (device_count == 0) {
-        fprintf(stderr, "[E] No CUDA devices found\n");
-        return -1;
-    }
-    if (report_cuda_error(cudaSetDevice(0), "set device") != 0) return -1;
-
-    size_t cuda_free_mem = 0;
-    size_t cuda_total_mem = 0;
-    bool have_cuda_mem_info = cudaMemGetInfo(&cuda_free_mem, &cuda_total_mem) == cudaSuccess;
+    int max_matches = 4096;
 
     int wif_len = (int)strlen(partial_wif);
     if (wif_len <= 0 || wif_len >= 64) {
@@ -718,16 +879,30 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     int desired_num_b = num_missing / 2;
     if (desired_num_b > 5) desired_num_b = 5;
-    int num_b = desired_num_b;
-    if (have_cuda_mem_info) {
-        size_t usable_table_mem = (cuda_free_mem * 85ULL) / 100ULL;
-        while (num_b > 0 && h_bsgs_table_bytes_for_split(num_b) > usable_table_mem) {
-            num_b--;
-        }
-        printf("[+] CUDA memory: %.2f GiB free / %.2f GiB total\n",
-            (double)cuda_free_mem / 1073741824.0,
-            (double)cuda_total_mem / 1073741824.0);
-    }
+
+    cudaDeviceProp cuda_prop;
+    memset(&cuda_prop, 0, sizeof(cuda_prop));
+    size_t cuda_free_mem = 0;
+    size_t cuda_total_mem = 0;
+    size_t planned_table_bytes = 0;
+    size_t planned_aux_bytes = 0;
+    size_t planned_reserve_bytes = 0;
+    int selected_table_chars = 0;
+    int selected_device = h_select_cuda_device(
+        desired_num_b,
+        num_missing,
+        max_matches,
+        &cuda_prop,
+        &cuda_free_mem,
+        &cuda_total_mem,
+        &selected_table_chars,
+        &planned_table_bytes,
+        &planned_aux_bytes,
+        &planned_reserve_bytes
+    );
+    if (selected_device < 0) return -1;
+
+    int num_b = selected_table_chars;
     int num_a = num_missing - num_b;
     if (num_a > 10 || num_b > 5) {
         fprintf(stderr, "[E] CUDA BSGS split is too large: A=%d B=%d\n", num_a, num_b);
@@ -740,7 +915,20 @@ extern "C" int cuda_wif_recovery_bsgs(
     for (int i = 0; i < num_a; i++) h_a_pos[i] = pos_copy[num_b + i];
 
     printf("[+] WIF recovery GPU BSGS mode enabled. Missing: %d chars\n", num_missing);
+    printf("[+] CUDA selected device %d: %s (cc %d.%d, SMs=%d)\n",
+        selected_device,
+        cuda_prop.name,
+        cuda_prop.major,
+        cuda_prop.minor,
+        cuda_prop.multiProcessorCount);
+    printf("[+] CUDA memory: %.2f GiB free / %.2f GiB total, %.2f GiB reserved\n",
+        (double)cuda_free_mem / 1073741824.0,
+        (double)cuda_total_mem / 1073741824.0,
+        (double)planned_reserve_bytes / 1073741824.0);
     printf("[+] BSGS split: table chars=%d, search chars=%d\n", num_b, num_a);
+    printf("[+] CUDA memory plan: table %.2f GiB, auxiliary %.2f MiB\n",
+        (double)planned_table_bytes / 1073741824.0,
+        (double)planned_aux_bytes / 1048576.0);
     if (num_b != desired_num_b) {
         fprintf(stderr,
             "[W] GPU memory is not enough for the balanced %d/%d split; using lower-memory %d/%d split. This avoids OOM but is slower.\n",
@@ -944,13 +1132,18 @@ extern "C" int cuda_wif_recovery_bsgs(
     GpuBsgsAProbe *d_a_probes = NULL;
     GpuBsgsMatch *h_matches = NULL;
     int zero = 0;
-    int max_matches = 4096;
     int rc = -1;
-    int threads_per_block = 256;
-    int blocks = launch_progress_blocks();
+    int threads_per_block = h_choose_threads_per_block(cuda_prop);
+    int b_blocks = h_choose_cuda_blocks(cuda_prop, b_combs, threads_per_block);
+    int a_blocks = h_choose_cuda_blocks(cuda_prop, a_combs, threads_per_block);
     time_t started_at = time(NULL);
     int h_match_count = 0;
     int matches_to_copy = 0;
+
+    printf("[+] CUDA launch config: B blocks=%d, A blocks=%d, threads=%d\n",
+        b_blocks,
+        a_blocks,
+        threads_per_block);
 
     if (report_cuda_error(cudaMalloc((void**)&d_p_missing_b, h_p_missing_b.size() * sizeof(GpuPointRaw)), "allocate B missing points") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_p_missing_a, h_p_missing_a.size() * sizeof(GpuPointRaw)), "allocate A missing points") != 0) goto cleanup_bsgs;
@@ -976,7 +1169,7 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     printf("[+] CUDA BSGS building B table on GPU...\n");
     print_cuda_progress(0, b_combs, 0, 1, started_at, "starting BSGS B");
-    wif_bsgs_build_b_kernel<<<blocks, threads_per_block>>>(
+    wif_bsgs_build_b_kernel<<<b_blocks, threads_per_block>>>(
         b_combs,
         d_p_missing_b,
         d_b_pos,
@@ -1067,7 +1260,7 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     printf("[+] CUDA BSGS searching A side on GPU...\n");
     print_cuda_progress(0, a_combs, 0, 1, started_at, "starting BSGS A");
-    wif_bsgs_search_a_kernel<<<blocks, threads_per_block>>>(
+    wif_bsgs_search_a_kernel<<<a_blocks, threads_per_block>>>(
         a_combs,
         d_p_missing_a,
         d_a_pos,

@@ -680,6 +680,11 @@ extern "C" int cuda_wif_recovery_bsgs(
     int zero = 0;
     int max_matches = 4096;
     int rc = -1;
+    int threads_per_block = 256;
+    int blocks = launch_progress_blocks();
+    time_t started_at = time(NULL);
+    int h_match_count = 0;
+    int matches_to_copy = 0;
 
     if (report_cuda_error(cudaMalloc((void**)&d_p_missing_b, h_p_missing_b.size() * sizeof(GpuPointRaw)), "allocate B missing points") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_p_missing_a, h_p_missing_a.size() * sizeof(GpuPointRaw)), "allocate A missing points") != 0) goto cleanup_bsgs;
@@ -702,10 +707,6 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (report_cuda_error(cudaMemcpy(d_pow58_mod32, h_pow58_mod32, 64 * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy pow58 table") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMemset(d_table, 0, table_bytes), "clear CUDA BSGS hash table") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMemcpy(d_match_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear CUDA BSGS match count") != 0) goto cleanup_bsgs;
-
-    int threads_per_block = 256;
-    int blocks = launch_progress_blocks();
-    time_t started_at = time(NULL);
 
     printf("[+] CUDA BSGS building B table on GPU...\n");
     print_cuda_progress(0, b_combs, 0, 1, started_at, "starting BSGS B");
@@ -747,7 +748,6 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS A kernel") != 0) goto cleanup_bsgs;
     print_cuda_progress(a_combs, a_combs, 0, 1, started_at, "finished BSGS A");
 
-    int h_match_count = 0;
     if (report_cuda_error(cudaMemcpy(&h_match_count, d_match_count, sizeof(int), cudaMemcpyDeviceToHost), "copy CUDA BSGS match count") != 0) goto cleanup_bsgs;
 
     if (h_match_count <= 0) {
@@ -756,7 +756,7 @@ extern "C" int cuda_wif_recovery_bsgs(
         goto cleanup_bsgs;
     }
 
-    int matches_to_copy = h_match_count > max_matches ? max_matches : h_match_count;
+    matches_to_copy = h_match_count > max_matches ? max_matches : h_match_count;
     if (h_match_count > max_matches) {
         fprintf(stderr, "[W] CUDA BSGS found %d point candidates; verifying first %d\n", h_match_count, max_matches);
     }

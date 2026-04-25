@@ -223,7 +223,7 @@ __device__ __forceinline__ uint256 field_sqr(const uint256& a) {
  * 需要约 256 次平方 + 约 128 次乘法
  */
 __device__ __forceinline__ uint256 field_inv(const uint256& a) {
-    uint256 result = uint256_ONE;
+    uint256 result = UINT256_ONE;
     uint256 base = a;
 
     /* P-2 的 4 个 64位字 (little-endian: exp[0]=LSB, exp[3]=MSB) */

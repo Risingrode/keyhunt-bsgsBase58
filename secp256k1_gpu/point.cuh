@@ -47,7 +47,7 @@ __device__ __forceinline__ ECPoint get_generator() {
                   0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL);
     G.y = uint256(0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL,
                   0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL);
-    G.z = uint256_ONE;
+    G.z = UINT256_ONE;
     return G;
 }
 
@@ -234,7 +234,7 @@ __device__ ECPoint point_add_affine(const ECPoint& P, const ECPoint& Q) {
     if (Q.is_infinity()) return P;
 
     /* 当 Q.z == 1 时的优化路径 */
-    if (Q.z.is_equal(uint256_ONE)) {
+    if (Q.z.is_equal(UINT256_ONE)) {
         /* Z2 = 1，简化计算 */
         uint256 z1_sq = field_sqr(P.z);           /* Z1² */
         uint256 z1_cb = field_mul(z1_sq, P.z);    /* Z1³ */
@@ -308,7 +308,7 @@ __device__ ECPoint point_reduce(const ECPoint& P) {
     ECPoint result;
     result.x = field_mul(P.x, z_inv2);       /* x = X / Z² */
     result.y = field_mul(P.y, z_inv3);       /* y = Y / Z³ */
-    result.z = uint256_ONE;                   /* 仿射坐标 Z = 1 */
+    result.z = UINT256_ONE;                   /* 仿射坐标 Z = 1 */
     return result;
 }
 
@@ -348,6 +348,6 @@ __device__ __forceinline__ ECPoint point_from_affine(const uint256& x, const uin
     ECPoint P;
     P.x = x;
     P.y = y;
-    P.z = uint256_ONE;
+    P.z = UINT256_ONE;
     return P;
 }

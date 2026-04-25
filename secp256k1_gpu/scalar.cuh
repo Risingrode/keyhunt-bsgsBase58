@@ -95,7 +95,7 @@ __device__ void wnaf_encode(int digits[257], const uint256& k, int w) {
             if (window >= limit) {
                 digits[i] = window - (1 << w);  /* 负数 digit */
                 /* 进位: 在 bit w 位置加 1 */
-                uint256 carry = uint256_ONE;
+                uint256 carry = UINT256_ONE;
                 for (int s = 0; s < w; s++) {
                     carry.shift_left_1();
                 }

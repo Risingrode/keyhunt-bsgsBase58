@@ -110,12 +110,6 @@ struct GpuPointRaw {
     GpuUint256Raw z;
 };
 
-struct GpuBsgsEntry {
-    uint64_t x_prefix;
-    uint32_t c_value;
-    uint32_t packed;
-};
-
 struct GpuBsgsMatch {
     uint64_t packed_a;
     uint32_t packed_b;
@@ -466,18 +460,54 @@ __device__ __forceinline__ uint64_t block_batch_x_prefix(
     return prefix == 0 ? 1ULL : prefix;
 }
 
-__device__ void bsgs_insert_entry(GpuBsgsEntry *table, uint32_t table_mask, uint64_t x_prefix, uint32_t c_value, uint32_t packed) {
+__device__ __forceinline__ uint32_t bsgs_packed_c_value(
+    uint32_t packed,
+    const int *b_pos,
+    int num_b,
+    int wif_len,
+    const uint32_t *pow58_mod32
+) {
+    uint32_t c_value = 0;
+    for (int i = 0; i < num_b; i++) {
+        uint32_t d = (packed >> (6 * i)) & 0x3FU;
+        c_value += d * pow58_mod32[wif_len - 1 - b_pos[i]];
+    }
+    return c_value;
+}
+
+__device__ __forceinline__ uint64_t bsgs_load_x_prefix(const uint64_t *table_x_prefix, uint32_t idx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+    return __ldg(&table_x_prefix[idx]);
+#else
+    return table_x_prefix[idx];
+#endif
+}
+
+__device__ __forceinline__ uint32_t bsgs_load_packed(const uint32_t *table_packed, uint32_t idx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 350
+    return __ldg(&table_packed[idx]);
+#else
+    return table_packed[idx];
+#endif
+}
+
+__device__ void bsgs_insert_entry(
+    uint64_t *table_x_prefix,
+    uint32_t *table_packed,
+    uint32_t table_mask,
+    uint64_t x_prefix,
+    uint32_t packed
+) {
     if (x_prefix == 0) x_prefix = 1;
     uint32_t idx = (uint32_t)x_prefix & table_mask;
     while (true) {
         unsigned long long old = atomicCAS(
-            (unsigned long long*)&table[idx].x_prefix,
+            (unsigned long long*)&table_x_prefix[idx],
             0ULL,
             (unsigned long long)x_prefix
         );
         if (old == 0ULL) {
-            table[idx].c_value = c_value;
-            table[idx].packed = packed;
+            table_packed[idx] = packed;
             return;
         }
         idx = (idx + 1) & table_mask;
@@ -492,7 +522,8 @@ __global__ void wif_bsgs_build_b_kernel(
     int wif_len,
     const uint32_t *pow58_mod32,
     const GpuPointRaw *carry_g,
-    GpuBsgsEntry *table,
+    uint64_t *table_x_prefix,
+    uint32_t *table_packed,
     uint32_t table_mask
 ) {
     extern __shared__ uint64_t shared_words[];
@@ -535,10 +566,9 @@ __global__ void wif_bsgs_build_b_kernel(
         __syncthreads();
         block_batch_invert_zs(shared_z, shared_products, batch_points);
 
-        uint32_t sum_c = (uint32_t)sum_c_wide;
         if (active) {
             uint64_t x_prefix = block_batch_x_prefix(shared_x, shared_z, threadIdx.x);
-            bsgs_insert_entry(table, table_mask, x_prefix, sum_c, packed);
+            bsgs_insert_entry(table_x_prefix, table_packed, table_mask, x_prefix, packed);
         }
         __syncthreads();
     }
@@ -556,8 +586,11 @@ __global__ void wif_bsgs_search_a_kernel(
     GpuPointRaw base_point_raw,
     GpuPointRaw g_s_raw,
     uint32_t c_k,
-    const GpuBsgsEntry *table,
+    const uint64_t *table_x_prefix,
+    const uint32_t *table_packed,
     uint32_t table_mask,
+    const int *b_pos,
+    int num_b,
     GpuBsgsMatch *matches,
     int *match_count,
     int max_matches
@@ -625,16 +658,18 @@ __global__ void wif_bsgs_search_a_kernel(
             for (uint32_t carry = 0; carry <= 2; carry++) {
                 uint64_t search_x = block_batch_x_prefix(shared_x, shared_z, point_base + (int)carry);
                 uint32_t idx = (uint32_t)search_x & table_mask;
+                uint64_t slot_x = bsgs_load_x_prefix(table_x_prefix, idx);
 
-                while (table[idx].x_prefix != 0) {
-                    if (table[idx].x_prefix == search_x) {
-                        uint32_t c_b = table[idx].c_value;
+                while (slot_x != 0) {
+                    if (slot_x == search_x) {
+                        uint32_t packed_b = bsgs_load_packed(table_packed, idx);
+                        uint32_t c_b = bsgs_packed_c_value(packed_b, b_pos, num_b, wif_len, pow58_mod32);
                         uint64_t total_c = (uint64_t)c_k + (uint64_t)sum_c + (uint64_t)c_b;
                         if ((total_c >> 32) == carry) {
                             int out_idx = atomicAdd(match_count, 1);
                             if (out_idx < max_matches) {
                                 matches[out_idx].packed_a = packed;
-                                matches[out_idx].packed_b = table[idx].packed;
+                                matches[out_idx].packed_b = packed_b;
                                 matches[out_idx].c_a = sum_c;
                                 matches[out_idx].c_b = c_b;
                                 matches[out_idx].carry = carry;
@@ -642,6 +677,7 @@ __global__ void wif_bsgs_search_a_kernel(
                         }
                     }
                     idx = (idx + 1) & table_mask;
+                    slot_x = bsgs_load_x_prefix(table_x_prefix, idx);
                 }
             }
         }
@@ -652,8 +688,13 @@ __global__ void wif_bsgs_search_a_kernel(
 __global__ void wif_bsgs_probe_b_table_kernel(
     GpuBsgsBProbe *probes,
     int num_probes,
-    const GpuBsgsEntry *table,
-    uint32_t table_mask
+    const uint64_t *table_x_prefix,
+    const uint32_t *table_packed,
+    uint32_t table_mask,
+    const int *b_pos,
+    int num_b,
+    int wif_len,
+    const uint32_t *pow58_mod32
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_probes) return;
@@ -661,15 +702,19 @@ __global__ void wif_bsgs_probe_b_table_kernel(
     uint64_t x_prefix = probes[i].x_prefix;
     uint32_t idx = (uint32_t)x_prefix & table_mask;
     int found = 0;
+    uint64_t slot_x = bsgs_load_x_prefix(table_x_prefix, idx);
 
-    while (table[idx].x_prefix != 0) {
-        if (table[idx].x_prefix == x_prefix &&
-            table[idx].c_value == probes[i].c_value &&
-            table[idx].packed == probes[i].packed) {
-            found = 1;
-            break;
+    while (slot_x != 0) {
+        uint32_t packed = bsgs_load_packed(table_packed, idx);
+        if (slot_x == x_prefix && packed == probes[i].packed) {
+            uint32_t c_value = bsgs_packed_c_value(packed, b_pos, num_b, wif_len, pow58_mod32);
+            if (c_value == probes[i].c_value) {
+                found = 1;
+                break;
+            }
         }
         idx = (idx + 1) & table_mask;
+        slot_x = bsgs_load_x_prefix(table_x_prefix, idx);
     }
 
     probes[i].found = found;
@@ -916,8 +961,11 @@ static HCudaLaunchConfig h_autotune_a_launch_config(
     GpuPointRaw base_point_raw,
     GpuPointRaw g_s_raw,
     uint32_t c_k,
-    const GpuBsgsEntry *d_table,
+    const uint64_t *d_table_x_prefix,
+    const uint32_t *d_table_packed,
     uint32_t table_mask,
+    const int *d_b_pos,
+    int num_b,
     GpuBsgsMatch *d_matches,
     int *d_match_count,
     int max_matches
@@ -973,8 +1021,11 @@ static HCudaLaunchConfig h_autotune_a_launch_config(
             base_point_raw,
             g_s_raw,
             c_k,
-            d_table,
+            d_table_x_prefix,
+            d_table_packed,
             table_mask,
+            d_b_pos,
+            num_b,
             d_matches,
             d_match_count,
             max_matches
@@ -1136,10 +1187,22 @@ static uint64_t h_bsgs_table_slots(uint64_t combinations) {
     return table_size;
 }
 
+static size_t h_bsgs_table_x_bytes(uint64_t slots) {
+    return (size_t)slots * sizeof(uint64_t);
+}
+
+static size_t h_bsgs_table_packed_bytes(uint64_t slots) {
+    return (size_t)slots * sizeof(uint32_t);
+}
+
+static size_t h_bsgs_table_bytes_for_slots(uint64_t slots) {
+    return h_bsgs_table_x_bytes(slots) + h_bsgs_table_packed_bytes(slots);
+}
+
 static size_t h_bsgs_table_bytes_for_split(int table_chars) {
     uint64_t combinations = h_pow58_u64(table_chars);
     uint64_t slots = h_bsgs_table_slots(combinations);
-    return (size_t)slots * sizeof(GpuBsgsEntry);
+    return h_bsgs_table_bytes_for_slots(slots);
 }
 
 extern "C" int cuda_wif_recovery_bsgs(
@@ -1450,10 +1513,15 @@ extern "C" int cuda_wif_recovery_bsgs(
     }
     uint32_t table_size = (uint32_t)table_size64;
     uint32_t table_mask = table_size - 1;
-    size_t table_bytes = (size_t)table_size * sizeof(GpuBsgsEntry);
+    size_t table_x_bytes = h_bsgs_table_x_bytes(table_size64);
+    size_t table_packed_bytes = h_bsgs_table_packed_bytes(table_size64);
+    size_t table_bytes = table_x_bytes + table_packed_bytes;
 
-    printf("[+] CUDA BSGS hash table: %u slots, %.2f GiB\n",
-        table_size, (double)table_bytes / 1073741824.0);
+    printf("[+] CUDA BSGS hash table: %u slots, %.2f GiB (x %.2f GiB + packed %.2f GiB, 12 B/slot)\n",
+        table_size,
+        (double)table_bytes / 1073741824.0,
+        (double)table_x_bytes / 1073741824.0,
+        (double)table_packed_bytes / 1073741824.0);
     printf("[+] CUDA BSGS combinations: table=%" PRIu64 ", search=%" PRIu64 "\n", b_combs, a_combs);
 
     GpuPointRaw *d_p_combined_b = NULL;
@@ -1462,7 +1530,8 @@ extern "C" int cuda_wif_recovery_bsgs(
     int *d_b_pos = NULL;
     int *d_a_pos = NULL;
     uint32_t *d_pow58_mod32 = NULL;
-    GpuBsgsEntry *d_table = NULL;
+    uint64_t *d_table_x_prefix = NULL;
+    uint32_t *d_table_packed = NULL;
     GpuBsgsMatch *d_matches = NULL;
     int *d_match_count = NULL;
     GpuBsgsBProbe *d_b_probes = NULL;
@@ -1499,7 +1568,11 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (report_cuda_error(cudaMalloc((void**)&d_b_pos, (num_b > 0 ? num_b : 1) * sizeof(int)), "allocate B positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_a_pos, (num_a > 0 ? num_a : 1) * sizeof(int)), "allocate A positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_pow58_mod32, 64 * sizeof(uint32_t)), "allocate pow58 table") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMalloc((void**)&d_table, table_bytes), "allocate CUDA BSGS hash table") != 0) {
+    if (report_cuda_error(cudaMalloc((void**)&d_table_x_prefix, table_x_bytes), "allocate CUDA BSGS x-prefix table") != 0) {
+        rc = -3;
+        goto cleanup_bsgs;
+    }
+    if (report_cuda_error(cudaMalloc((void**)&d_table_packed, table_packed_bytes), "allocate CUDA BSGS packed table") != 0) {
         rc = -3;
         goto cleanup_bsgs;
     }
@@ -1512,7 +1585,7 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (num_b > 0 && report_cuda_error(cudaMemcpy(d_b_pos, h_b_pos, num_b * sizeof(int), cudaMemcpyHostToDevice), "copy B positions") != 0) goto cleanup_bsgs;
     if (num_a > 0 && report_cuda_error(cudaMemcpy(d_a_pos, h_a_pos, num_a * sizeof(int), cudaMemcpyHostToDevice), "copy A positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMemcpy(d_pow58_mod32, h_pow58_mod32, 64 * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy pow58 table") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMemset(d_table, 0, table_bytes), "clear CUDA BSGS hash table") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMemset(d_table_x_prefix, 0, table_x_bytes), "clear CUDA BSGS x-prefix table") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMemcpy(d_match_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear CUDA BSGS match count") != 0) goto cleanup_bsgs;
 
     printf("[+] CUDA BSGS building B table on GPU...\n");
@@ -1525,7 +1598,8 @@ extern "C" int cuda_wif_recovery_bsgs(
         wif_len,
         d_pow58_mod32,
         d_carry_g,
-        d_table,
+        d_table_x_prefix,
+        d_table_packed,
         table_mask
     );
     if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS B kernel") != 0) goto cleanup_bsgs;
@@ -1539,8 +1613,13 @@ extern "C" int cuda_wif_recovery_bsgs(
         wif_bsgs_probe_b_table_kernel<<<1, 32>>>(
             d_b_probes,
             (int)h_b_probes.size(),
-            d_table,
-            table_mask
+            d_table_x_prefix,
+            d_table_packed,
+            table_mask,
+            d_b_pos,
+            num_b,
+            wif_len,
+            d_pow58_mod32
         );
         if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS B self-test") != 0) goto cleanup_bsgs;
         if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS B self-test") != 0) goto cleanup_bsgs;
@@ -1619,8 +1698,11 @@ extern "C" int cuda_wif_recovery_bsgs(
         h_point_to_raw(base_point),
         h_point_to_raw(g_s),
         c_k,
-        d_table,
+        d_table_x_prefix,
+        d_table_packed,
         table_mask,
+        d_b_pos,
+        num_b,
         d_matches,
         d_match_count,
         max_matches
@@ -1657,8 +1739,11 @@ extern "C" int cuda_wif_recovery_bsgs(
             h_point_to_raw(base_point),
             h_point_to_raw(g_s),
             c_k,
-            d_table,
+            d_table_x_prefix,
+            d_table_packed,
             table_mask,
+            d_b_pos,
+            num_b,
             d_matches,
             d_match_count,
             max_matches
@@ -1725,7 +1810,8 @@ cleanup_bsgs:
     if (d_b_pos != NULL) cudaFree(d_b_pos);
     if (d_a_pos != NULL) cudaFree(d_a_pos);
     if (d_pow58_mod32 != NULL) cudaFree(d_pow58_mod32);
-    if (d_table != NULL) cudaFree(d_table);
+    if (d_table_x_prefix != NULL) cudaFree(d_table_x_prefix);
+    if (d_table_packed != NULL) cudaFree(d_table_packed);
     if (d_matches != NULL) cudaFree(d_matches);
     if (d_match_count != NULL) cudaFree(d_match_count);
     if (d_b_probes != NULL) cudaFree(d_b_probes);

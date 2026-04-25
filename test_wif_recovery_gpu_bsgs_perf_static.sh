@@ -35,6 +35,20 @@ if ! grep -q 'CUDA BSGS precomputed combined digit tables' wif_recovery_cuda.cu;
     exit 1
 fi
 
+if grep -q 'struct GpuBsgsEntry' wif_recovery_cuda.cu ||
+   grep -q 'sizeof(GpuBsgsEntry)' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS table should use split x-prefix/packed arrays, not 16-byte entries" >&2
+    exit 1
+fi
+
+if ! grep -Fq 'uint64_t *d_table_x_prefix' wif_recovery_cuda.cu ||
+   ! grep -Fq 'uint32_t *d_table_packed' wif_recovery_cuda.cu ||
+   ! grep -q 'bsgs_packed_c_value' wif_recovery_cuda.cu ||
+   ! grep -q '12 B/slot' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS should compress the B table to x-prefix plus packed digits" >&2
+    exit 1
+fi
+
 if ! grep -q 'point_add_affine(sum_p, raw_to_point(p_combined_b' wif_recovery_cuda.cu ||
    ! grep -q 'point_add_affine(sum_p, raw_to_point(p_combined_a' wif_recovery_cuda.cu ||
    ! grep -q 'point_add_affine(sum_p, raw_to_point(carry_g' wif_recovery_cuda.cu; then
@@ -68,4 +82,4 @@ if ! grep -q 'a_chunk_combos' wif_recovery_cuda.cu ||
     exit 1
 fi
 
-echo "[PASS] CUDA WIF BSGS uses precomputed combined digit tables"
+echo "[PASS] CUDA WIF BSGS uses compressed B table and precomputed combined digit tables"

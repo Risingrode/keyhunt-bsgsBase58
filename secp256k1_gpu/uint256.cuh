@@ -13,12 +13,12 @@ struct uint256 {
 
     /* ---- Constructors ---- */
 
-    __device__ __forceinline__ uint256() : v{0ULL, 0ULL, 0ULL, 0ULL} {}
+    __host__ __device__ __forceinline__ uint256() : v{0ULL, 0ULL, 0ULL, 0ULL} {}
 
-    __device__ __forceinline__ explicit uint256(uint64_t a)
+    __host__ __device__ __forceinline__ explicit uint256(uint64_t a)
         : v{a, 0ULL, 0ULL, 0ULL} {}
 
-    __device__ __forceinline__ uint256(uint64_t v0, uint64_t v1, uint64_t v2, uint64_t v3)
+    __host__ __device__ __forceinline__ uint256(uint64_t v0, uint64_t v1, uint64_t v2, uint64_t v3)
         : v{v0, v1, v2, v3} {}
 
     /* ---- Comparison ---- */

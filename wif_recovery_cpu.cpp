@@ -114,6 +114,92 @@ const uint8_t* global_target_pubkey;
 int global_target_pubkey_len;
 int global_compressed;
 
+struct ProgressState {
+    const char *label;
+    uint64_t total;
+    uint64_t done;
+    uint64_t next_report;
+    uint64_t report_stride;
+    time_t started_at;
+    time_t last_print_at;
+    uint64_t last_print_done;
+    int active;
+    int printed;
+};
+
+static ProgressState progress_B;
+static ProgressState progress_A;
+
+static void progress_print(ProgressState *progress);
+
+static void progress_start(ProgressState *progress, const char *label, uint64_t total) {
+    progress->label = label;
+    progress->total = total;
+    progress->done = 0;
+    progress->report_stride = total / 1000;
+    if (progress->report_stride < 1) progress->report_stride = 1;
+    if (progress->report_stride > 1048576) progress->report_stride = 1048576;
+    progress->next_report = progress->report_stride;
+    progress->started_at = time(NULL);
+    progress->last_print_at = 0;
+    progress->last_print_done = 0;
+    progress->active = 1;
+    progress->printed = 0;
+    progress_print(progress);
+}
+
+static void progress_print(ProgressState *progress) {
+    time_t now = time(NULL);
+    double elapsed = difftime(now, progress->started_at);
+    double rate = elapsed > 0.0 ? (double)progress->done / elapsed : 0.0;
+    double percent = progress->total > 0 ? ((double)progress->done * 100.0) / (double)progress->total : 100.0;
+    double eta = rate > 0.0 && progress->done < progress->total
+        ? ((double)(progress->total - progress->done) / rate)
+        : 0.0;
+
+    printf("\r[+] %s progress: %llu/%llu (%.2f%%), %.0f combos/s, ETA %.0fs",
+        progress->label,
+        (unsigned long long)progress->done,
+        (unsigned long long)progress->total,
+        percent,
+        rate,
+        eta);
+    fflush(stdout);
+    progress->last_print_at = now;
+    progress->last_print_done = progress->done;
+    progress->printed = 1;
+}
+
+static void progress_tick(ProgressState *progress) {
+    if (!progress->active) return;
+    progress->done++;
+    if (progress->done < progress->total && progress->done < progress->next_report) return;
+
+    time_t now = time(NULL);
+    if (progress->done < progress->total && now == progress->last_print_at) {
+        progress->next_report = progress->done + progress->report_stride;
+        return;
+    }
+
+    progress_print(progress);
+    progress->next_report = progress->done + progress->report_stride;
+}
+
+static void progress_finish(ProgressState *progress) {
+    if (!progress->active) return;
+    if (!progress->printed || progress->done != progress->last_print_done) {
+        progress_print(progress);
+    }
+    printf("\n");
+    progress->active = 0;
+}
+
+static void progress_newline_if_needed() {
+    if ((progress_A.active && progress_A.printed) || (progress_B.active && progress_B.printed)) {
+        printf("\n");
+    }
+}
+
 static bool point_is_infinity(Point &p) {
     return p.z.IsZero() || (p.x.IsZero() && p.y.IsZero());
 }
@@ -169,6 +255,7 @@ void dfs_B(int idx, Point sum_P, uint32_t sum_C, uint32_t packed) {
         Point P_B = point_add(sum_P, C_P);
         if (!point_is_infinity(P_B)) P_B.Reduce();
         insert_hash(point_is_infinity(P_B) ? 1 : P_B.x.bits64[0], sum_C, packed);
+        progress_tick(&progress_B);
         return;
     }
     for(int d=0; d<58; d++) {
@@ -194,6 +281,7 @@ void check_full_match(uint64_t packed_A, uint32_t packed_B) {
     }
     uint8_t privkey[32];
     if (verify_wif_checksum(candidate, privkey)) {
+        progress_newline_if_needed();
         printf("Checksum matched!\n");
         if (verify_privkey_pubkey(privkey, global_target_pubkey, global_target_pubkey_len, global_compressed)) {
             strcpy(final_wif, candidate);
@@ -205,6 +293,7 @@ void check_full_match(uint64_t packed_A, uint32_t packed_B) {
 void dfs_A(int idx, Point sum_P, uint32_t sum_C, uint64_t packed) {
     if (found_match) return;
     if (idx == num_A) {
+        progress_tick(&progress_A);
         Point C_P = compute_C_G(sum_C);
         C_P = point_neg(C_P);
         
@@ -406,12 +495,16 @@ extern "C" int cpu_wif_recovery(
     
     printf("[+] Populating BSGS table with %lu combinations (B steps)...\n", b_combs);
     Point start_P; start_P.Clear();
+    progress_start(&progress_B, "BSGS B steps", b_combs);
     dfs_B(0, start_P, 0, 0);
+    progress_finish(&progress_B);
     
     uint64_t a_combs = 1;
     for(int i=0; i<num_A; i++) a_combs *= 58;
     printf("[+] Searching %lu combinations (A steps)...\n", a_combs);
+    progress_start(&progress_A, "BSGS A steps", a_combs);
     dfs_A(0, start_P, 0, 0);
+    progress_finish(&progress_A);
     
     free(bsgs_table);
     

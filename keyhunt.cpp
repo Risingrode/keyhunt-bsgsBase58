@@ -31,6 +31,7 @@ email: albertobsd@gmail.com
 #ifdef CRYPTO_GPU
 #include "bsgs_cuda.h"
 #include "wif_recovery_cuda.h"
+#include "wif_recovery_bsgs_cuda.h"
 #endif
 
 #if defined(_WIN64) && !defined(__CYGWIN__)
@@ -527,8 +528,8 @@ static int run_bsgs_wif_recovery_for_loaded_points(const char *partial_wif,bool 
 		int rc = -1;
 		if(use_gpu) {
 #ifdef CRYPTO_GPU
-			printf("[+] WIF recovery GPU mode enabled\n");
-			rc = cuda_wif_recovery(
+			printf("[+] WIF recovery GPU BSGS mode enabled\n");
+			rc = cuda_wif_recovery_bsgs(
 				partial_wif,
 				missing_positions.data(),
 				num_missing,

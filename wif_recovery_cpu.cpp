@@ -93,7 +93,6 @@ void insert_hash(uint64_t x, uint32_t c, uint32_t packed) {
     bsgs_table[idx].packed = packed;
 }
 
-Point T_G[4][256];
 Point P_missing_B[10][58];
 Point P_missing_A[32][58];
 
@@ -102,7 +101,7 @@ int B_pos[64];
 int num_A, num_B;
 
 Point BasePoint;
-Point Neg_G_S;
+Point G_S;
 uint32_t pow58_mod32[64];
 uint32_t C_K;
 int global_wif_len;
@@ -114,39 +113,61 @@ const uint8_t* global_target_pubkey;
 int global_target_pubkey_len;
 int global_compressed;
 
+static bool point_is_infinity(Point &p) {
+    return p.z.IsZero() || (p.x.IsZero() && p.y.IsZero());
+}
+
+static Point point_neg(Point &p) {
+    Point zero;
+    zero.Clear();
+    if (point_is_infinity(p)) return zero;
+    Point reduced = p;
+    reduced.Reduce();
+    return secp->Negation(reduced);
+}
+
+static Point point_add(Point &a, Point &b) {
+    if (point_is_infinity(a)) return b;
+    if (point_is_infinity(b)) return a;
+    Point r = secp->Add(a, b);
+    if (r.z.IsZero()) r.Clear();
+    return r;
+}
+
+static Point point_double(Point &p) {
+    Point zero;
+    zero.Clear();
+    if (point_is_infinity(p)) return zero;
+    Point r = secp->Double(p);
+    if (r.z.IsZero()) r.Clear();
+    return r;
+}
+
+static Point multiply_g(Int &scalar) {
+    Point zero;
+    zero.Clear();
+    if (scalar.IsZero()) return zero;
+    return secp->ComputePublicKey(&scalar);
+}
+
 Point compute_C_G(uint32_t C) {
-    Point P; P.Clear();
-    for(int i=0; i<4; i++) {
-        uint8_t byte = (C >> (i*8)) & 0xFF;
-        if (byte != 0) {
-            if (P.isZero()) P = T_G[i][byte];
-            else P = secp->Add(P, T_G[i][byte]);
-        }
-    }
-    return P;
+    Int c((uint64_t)C);
+    return multiply_g(c);
 }
 
 void dfs_B(int idx, Point sum_P, uint32_t sum_C, uint32_t packed) {
     if (idx == num_B) {
         Point C_P = compute_C_G(sum_C);
-        C_P = secp->Negation(C_P);
-        Point P_B;
-        if (sum_P.isZero()) {
-            P_B = C_P;
-        } else if (C_P.isZero()) {
-            P_B = sum_P;
-        } else {
-            P_B = secp->Add(sum_P, C_P);
-        }
-        if (!P_B.isZero()) P_B.Reduce();
-        insert_hash(P_B.isZero() ? 1 : P_B.x.bits64[0], sum_C, packed);
+        C_P = point_neg(C_P);
+        Point P_B = point_add(sum_P, C_P);
+        if (!point_is_infinity(P_B)) P_B.Reduce();
+        insert_hash(point_is_infinity(P_B) ? 1 : P_B.x.bits64[0], sum_C, packed);
         return;
     }
     for(int d=0; d<58; d++) {
         Point next_P = sum_P;
         if (d > 0) {
-            if (next_P.isZero()) next_P = P_missing_B[idx][d];
-            else next_P = secp->Add(next_P, P_missing_B[idx][d]);
+            next_P = point_add(next_P, P_missing_B[idx][d]);
         }
         uint32_t next_C = sum_C + (d * pow58_mod32[global_wif_len - 1 - B_pos[idx]]);
         dfs_B(idx + 1, next_P, next_C, packed | ((uint32_t)d << (6 * idx)));
@@ -164,7 +185,6 @@ void check_full_match(uint64_t packed_A, uint32_t packed_B) {
         int d = (packed_B >> (6 * i)) & 0x3F;
         candidate[B_pos[i]] = base58[d];
     }
-    // printf("Testing candidate: %s\n", candidate);
     uint8_t privkey[32];
     if (verify_wif_checksum(candidate, privkey)) {
         printf("Checksum matched!\n");
@@ -179,32 +199,24 @@ void dfs_A(int idx, Point sum_P, uint32_t sum_C, uint64_t packed) {
     if (found_match) return;
     if (idx == num_A) {
         Point C_P = compute_C_G(sum_C);
-        C_P = secp->Negation(C_P);
+        C_P = point_neg(C_P);
         
-        Point P_A;
-        if (sum_P.isZero()) P_A = C_P;
-        else if (C_P.isZero()) P_A = sum_P;
-        else P_A = secp->Add(sum_P, C_P);
+        Point P_A = point_add(sum_P, C_P);
+        Point Neg_PA = point_neg(P_A);
         
-        Point Neg_PA = secp->Negation(P_A);
-        
-        Point Base_minus_PA;
-        if (BasePoint.isZero()) Base_minus_PA = Neg_PA;
-        else if (Neg_PA.isZero()) Base_minus_PA = BasePoint;
-        else Base_minus_PA = secp->Add(BasePoint, Neg_PA);
+        Point Base_minus_PA = point_add(BasePoint, Neg_PA);
         
         Point Target = Base_minus_PA;
         
         for(int carry = 0; carry <= 2; carry++) {
             if (carry > 0) {
-                if (Target.isZero()) Target = Neg_G_S;
-                else if (!Neg_G_S.isZero()) Target = secp->Add(Target, Neg_G_S);
+                Target = point_add(Target, G_S);
             }
             
             Point T = Target;
-            if (!T.isZero()) T.Reduce();
+            if (!point_is_infinity(T)) T.Reduce();
             
-            uint64_t search_x = T.isZero() ? 1 : T.x.bits64[0];
+            uint64_t search_x = point_is_infinity(T) ? 1 : T.x.bits64[0];
             uint32_t h_idx = search_x & table_mask;
             
             while(bsgs_table[h_idx].x_prefix != 0) {
@@ -224,8 +236,7 @@ void dfs_A(int idx, Point sum_P, uint32_t sum_C, uint64_t packed) {
     for(int d=0; d<58; d++) {
         Point next_P = sum_P;
         if (d > 0) {
-            if (next_P.isZero()) next_P = P_missing_A[idx][d];
-            else next_P = secp->Add(next_P, P_missing_A[idx][d]);
+            next_P = point_add(next_P, P_missing_A[idx][d]);
         }
         uint32_t next_C = sum_C + (d * pow58_mod32[global_wif_len - 1 - A_pos[idx]]);
         dfs_A(idx + 1, next_P, next_C, packed | ((uint64_t)d << (6 * idx)));
@@ -263,7 +274,7 @@ extern "C" int cpu_wif_recovery(
         }
     }
     
-    num_B = (num_missing > 8) ? 4 : num_missing / 2;
+    num_B = num_missing / 2;
     if (num_B > 5) num_B = 5;
     num_A = num_missing - num_B;
     
@@ -284,18 +295,26 @@ extern "C" int cpu_wif_recovery(
     pow58_mod32[0] = 1;
     for(int i=1; i<64; i++) pow58_mod32[i] = pow58_mod32[i-1] * 58;
     
-    Int V_known(0);
+    Int V_known_mod(0);
+    uint32_t known_low = 0;
     for(int i=0; i<global_wif_len; i++) {
-        V_known.Mult(58);
+        int digit = 0;
         if (partial_wif[i] != '*' && partial_wif[i] != '?') {
-            V_known.Add( get_base58_value(partial_wif[i]) );
+            digit = get_base58_value(partial_wif[i]);
         }
+        known_low = known_low * 58 + (uint32_t)digit;
+        V_known_mod.Mult(58);
+        V_known_mod.Add((uint64_t)digit);
+        V_known_mod.Mod(&secp->order);
     }
     
-    C_K = V_known.bits[0];
-    Int vk = V_known;
-    vk.bits[0] = 0;
-    vk.Mod(&secp->order);
+    C_K = known_low;
+    Int vk = V_known_mod;
+    Int low_part((uint64_t)C_K);
+    if(vk.IsLower(&low_part)) {
+        vk.Add(&secp->order);
+    }
+    vk.Sub(&low_part);
     
     Int Const_S(0x80);
     int s_shifts = compressed ? 296 : 288;
@@ -310,44 +329,31 @@ extern "C" int cpu_wif_recovery(
         Const_S.Mod(&secp->order);
     }
     
-    Int P_mult(1);
     int p_shifts = compressed ? 40 : 32;
-    for(int i=0; i<p_shifts; i++) { P_mult.Add(&P_mult); P_mult.Mod(&secp->order); }
-    
-    Point P_scaled = secp->ScalarMultiplication(P_target, &P_mult);
-    Point p1 = secp->ScalarMultiplication(secp->G, &vk);
+    Point P_scaled = P_target;
+    for(int i=0; i<p_shifts; i++) P_scaled = point_double(P_scaled);
+
+    Point p1 = multiply_g(vk);
     p1 = secp->Negation(p1);
-    Point p2 = secp->ScalarMultiplication(secp->G, &Const_S);
+    Point p2 = multiply_g(Const_S);
     
-    BasePoint = secp->Add(P_scaled, p1);
-    BasePoint = secp->Add(BasePoint, p2);
+    BasePoint = point_add(P_scaled, p1);
+    BasePoint = point_add(BasePoint, p2);
     
     Int S_val(1);
     for(int i=0; i<32; i++) { S_val.Add(&S_val); S_val.Mod(&secp->order); }
-    Point G_S = secp->ScalarMultiplication(secp->G, &S_val);
-    Neg_G_S = secp->Negation(G_S);
+    G_S = multiply_g(S_val);
     
-    Point cur = secp->G;
-    for(int i=0; i<4; i++) {
-        T_G[i][0].Clear();
-        for(int j=1; j<256; j++) {
-            if (j == 1) T_G[i][j] = cur;
-            else T_G[i][j] = secp->Add(T_G[i][j-1], cur);
-        }
-        Point next_cur = cur;
-        for(int k=0; k<8; k++) next_cur = secp->Double(next_cur);
-        cur = next_cur;
-    }
-
     for(int i=0; i<num_B; i++) {
         Int exp(1);
         int p = global_wif_len - 1 - B_pos[i];
         for(int k=0; k<p; k++) { exp.Mult(58); exp.Mod(&secp->order); }
-        Point base_p = secp->ScalarMultiplication(secp->G, &exp);
         P_missing_B[i][0].Clear();
         for(int d=1; d<58; d++) {
-            if (d == 1) P_missing_B[i][d] = base_p;
-            else P_missing_B[i][d] = secp->Add(P_missing_B[i][d-1], base_p);
+            Int digit_exp(&exp);
+            digit_exp.Mult((uint64_t)d);
+            digit_exp.Mod(&secp->order);
+            P_missing_B[i][d] = multiply_g(digit_exp);
         }
     }
     
@@ -355,11 +361,12 @@ extern "C" int cpu_wif_recovery(
         Int exp(1);
         int p = global_wif_len - 1 - A_pos[i];
         for(int k=0; k<p; k++) { exp.Mult(58); exp.Mod(&secp->order); }
-        Point base_p = secp->ScalarMultiplication(secp->G, &exp);
         P_missing_A[i][0].Clear();
         for(int d=1; d<58; d++) {
-            if (d == 1) P_missing_A[i][d] = base_p;
-            else P_missing_A[i][d] = secp->Add(P_missing_A[i][d-1], base_p);
+            Int digit_exp(&exp);
+            digit_exp.Mult((uint64_t)d);
+            digit_exp.Mod(&secp->order);
+            P_missing_A[i][d] = multiply_g(digit_exp);
         }
     }
     

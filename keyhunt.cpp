@@ -428,7 +428,6 @@ Int lambda,lambda2,beta,beta2;
 
 Secp256K1 *secp;
 
-#ifdef CRYPTO_GPU
 static bool is_wif_wildcard(char c) {
 	return c == '*' || c == '?' || c == '.';
 }
@@ -453,7 +452,16 @@ static bool hex_to_bytes(const char *hex,std::vector<uint8_t> &out) {
 	}
 	return true;
 }
-#endif
+
+extern "C" int cpu_wif_recovery(
+	const char *partial_wif,
+	const int *missing_positions,
+	int num_missing,
+	const uint8_t *target_pubkey,
+	int target_pubkey_len,
+	int compressed,
+	char *result_wif
+);
 
 static void bytes_to_hex(const uint8_t *bytes,int len,char *dst,size_t dst_size) {
 	static const char hex[] = "0123456789abcdef";
@@ -469,7 +477,6 @@ static void bytes_to_hex(const uint8_t *bytes,int len,char *dst,size_t dst_size)
 	dst[len * 2] = 0;
 }
 
-#ifdef CRYPTO_GPU
 static int collect_wif_missing_positions(const char *partial_wif,std::vector<int> &positions) {
 	positions.clear();
 	for(int i = 0; partial_wif[i] != 0; i++) {
@@ -479,7 +486,6 @@ static int collect_wif_missing_positions(const char *partial_wif,std::vector<int
 	}
 	return (int)positions.size();
 }
-#endif
 
 extern "C" int verify_privkey_pubkey(const uint8_t* privkey_bytes, const uint8_t* target_pubkey, int target_pubkey_len, int compressed) {
 	if(privkey_bytes == NULL || target_pubkey == NULL || (target_pubkey_len != 33 && target_pubkey_len != 65)) {
@@ -499,12 +505,11 @@ extern "C" int verify_privkey_pubkey(const uint8_t* privkey_bytes, const uint8_t
 	return ok;
 }
 
-#ifdef CRYPTO_GPU
-static int run_cuda_wif_recovery_for_loaded_points(const char *partial_wif) {
+static int run_bsgs_wif_recovery_for_loaded_points(const char *partial_wif) {
 	std::vector<int> missing_positions;
 	int num_missing = collect_wif_missing_positions(partial_wif,missing_positions);
 	if(num_missing == 0) {
-		fprintf(stderr,"[E] WIF recovery with -g needs at least one wildcard character\n");
+		fprintf(stderr,"[E] WIF recovery needs at least one wildcard character\n");
 		return -2;
 	}
 
@@ -519,7 +524,7 @@ static int run_cuda_wif_recovery_for_loaded_points(const char *partial_wif) {
 		free(pubhex);
 
 		char recovered_wif[64] = {0};
-		int rc = cuda_wif_recovery(
+		int rc = cpu_wif_recovery(
 			partial_wif,
 			missing_positions.data(),
 			num_missing,
@@ -544,7 +549,6 @@ static int run_cuda_wif_recovery_for_loaded_points(const char *partial_wif) {
 	}
 	return 1;
 }
-#endif
 
 int main(int argc, char **argv)	{
 	char buffer[2048];
@@ -1322,6 +1326,21 @@ int main(int argc, char **argv)	{
 			exit(EXIT_FAILURE);
 		}
 		if(FLAGWIFRECOVERY) {
+			std::vector<int> missing_positions;
+			if(str_partial_wif != NULL && collect_wif_missing_positions(str_partial_wif,missing_positions) > 0) {
+				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif);
+				if(wif_rc == 0) {
+					printf("All points were found\n");
+					exit(EXIT_SUCCESS);
+				}
+				if(wif_rc == 1) {
+					fprintf(stderr, "[E] WIF BSGS recovery did not find a matching key\n");
+				}
+				else {
+					fprintf(stderr, "[E] WIF BSGS recovery failed with code %d\n", wif_rc);
+				}
+				exit(EXIT_FAILURE);
+			}
 			salir = 1;
 			for(j = 0; j < (int)bsgs_point_number; j++) {
 				if(bsgs_found[j] == 0 && record_bsgs_key_found((uint32_t)j,&n_range_start)) {
@@ -2349,23 +2368,18 @@ int main(int argc, char **argv)	{
 
 		if(FLAGGPU && FLAGMODE == MODE_BSGS) {
 			if(FLAGWIFRECOVERY) {
-#ifdef CRYPTO_GPU
-				int cuda_wif_rc = run_cuda_wif_recovery_for_loaded_points(str_partial_wif);
-				if(cuda_wif_rc == 0) {
+				int wif_rc = run_bsgs_wif_recovery_for_loaded_points(str_partial_wif);
+				if(wif_rc == 0) {
 					printf("All points were found\n");
 					exit(EXIT_SUCCESS);
 				}
-				if(cuda_wif_rc == 1) {
-					fprintf(stderr, "[E] CUDA WIF recovery did not find a matching key\n");
+				if(wif_rc == 1) {
+					fprintf(stderr, "[E] WIF BSGS recovery did not find a matching key\n");
 				}
 				else {
-					fprintf(stderr, "[E] CUDA WIF recovery failed with code %d\n", cuda_wif_rc);
+					fprintf(stderr, "[E] WIF BSGS recovery failed with code %d\n", wif_rc);
 				}
 				exit(EXIT_FAILURE);
-#else
-				fprintf(stderr, "[E] GPU support not compiled. Use 'make gpu' to build WIF recovery with CUDA support.\n");
-				exit(EXIT_FAILURE);
-#endif
 			}
 			else {
 #ifdef CRYPTO_GPU

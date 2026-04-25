@@ -93,6 +93,7 @@ void insert_hash(uint64_t x, uint32_t c, uint32_t packed) {
     bsgs_table[idx].packed = packed;
 }
 
+Point T_G[4][256];
 Point P_missing_B[10][58];
 Point P_missing_A[32][58];
 
@@ -151,8 +152,14 @@ static Point multiply_g(Int &scalar) {
 }
 
 Point compute_C_G(uint32_t C) {
-    Int c((uint64_t)C);
-    return multiply_g(c);
+    Point P; P.Clear();
+    for(int i=0; i<4; i++) {
+        uint8_t byte = (C >> (i*8)) & 0xFF;
+        if (byte != 0) {
+            P = point_add(P, T_G[i][byte]);
+        }
+    }
+    return P;
 }
 
 void dfs_B(int idx, Point sum_P, uint32_t sum_C, uint32_t packed) {
@@ -343,6 +350,18 @@ extern "C" int cpu_wif_recovery(
     Int S_val(1);
     for(int i=0; i<32; i++) { S_val.Add(&S_val); S_val.Mod(&secp->order); }
     G_S = multiply_g(S_val);
+
+    for(int i=0; i<4; i++) {
+        T_G[i][0].Clear();
+        for(int j=1; j<256; j++) {
+            Int scalar((uint64_t)j);
+            for(int k=0; k<(i * 8); k++) {
+                scalar.Add(&scalar);
+                scalar.Mod(&secp->order);
+            }
+            T_G[i][j] = multiply_g(scalar);
+        }
+    }
     
     for(int i=0; i<num_B; i++) {
         Int exp(1);

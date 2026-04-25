@@ -372,9 +372,13 @@ extern "C" int cpu_wif_recovery(
     
     uint64_t b_combs = 1;
     for(int i=0; i<num_B; i++) b_combs *= 58;
+    uint64_t min_table_size = b_combs + (b_combs / 2);
     table_size = 2;
-    while(table_size < b_combs * 2) table_size *= 2;
+    while(table_size < min_table_size) table_size *= 2;
     table_mask = table_size - 1;
+    printf("[+] BSGS hash table: %u slots, %.2f GiB\n",
+        table_size,
+        ((double)table_size * (double)sizeof(HashEntry)) / 1073741824.0);
     bsgs_table = (HashEntry*)calloc(table_size, sizeof(HashEntry));
     if (!bsgs_table) {
         printf("[-] Failed to allocate %lu bytes for BSGS table\n", table_size * sizeof(HashEntry));

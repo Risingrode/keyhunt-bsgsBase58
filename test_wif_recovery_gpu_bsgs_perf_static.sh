@@ -54,4 +54,18 @@ if ! grep -q 'wif_bsgs_build_b_kernel<<<b_blocks, threads_per_block, b_shared_by
     exit 1
 fi
 
+if ! grep -q 'h_autotune_a_launch_config' wif_recovery_cuda.cu ||
+   ! grep -q 'cudaEventElapsedTime' wif_recovery_cuda.cu ||
+   ! grep -q 'CUDA autotune A config' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS should autotune A-side launch configuration on the selected GPU" >&2
+    exit 1
+fi
+
+if ! grep -q 'a_chunk_combos' wif_recovery_cuda.cu ||
+   ! grep -q 'CUDA A-side progress chunk' wif_recovery_cuda.cu ||
+   ! grep -q 'print_cuda_progress(a_processed, a_combs' wif_recovery_cuda.cu; then
+    echo "[FAIL] CUDA WIF BSGS should chunk A-side search and report live progress" >&2
+    exit 1
+fi
+
 echo "[PASS] CUDA WIF BSGS uses precomputed combined digit tables"

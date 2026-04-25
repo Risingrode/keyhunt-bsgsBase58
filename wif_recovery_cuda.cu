@@ -545,6 +545,7 @@ __global__ void wif_bsgs_build_b_kernel(
 }
 
 __global__ void wif_bsgs_search_a_kernel(
+    uint64_t start_combo,
     uint64_t total,
     const GpuPointRaw *p_combined_a,
     const int *a_pos,
@@ -575,8 +576,9 @@ __global__ void wif_bsgs_search_a_kernel(
     ECPoint neg_g_s = point_neg(g_s);
 
     for (uint64_t tile_base = block_start; tile_base < total; tile_base += grid_stride) {
-        uint64_t combo = tile_base + threadIdx.x;
-        bool active = combo < total;
+        uint64_t local_combo = tile_base + threadIdx.x;
+        uint64_t combo = start_combo + local_combo;
+        bool active = local_combo < total;
         ECPoint sum_p;
         sum_p.set_infinity();
         uint64_t sum_c_wide = 0;
@@ -763,6 +765,35 @@ static size_t h_cuda_batch_shared_bytes(int threads_per_block, int points_per_co
     return (size_t)threads_per_block * (size_t)points_per_combo * 3ULL * sizeof(uint256);
 }
 
+static size_t h_cuda_max_shared_mem_per_block(const cudaDeviceProp &prop) {
+    size_t limit = prop.sharedMemPerBlock;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
+    if ((size_t)prop.sharedMemPerBlockOptin > limit) {
+        limit = prop.sharedMemPerBlockOptin;
+    }
+#endif
+    return limit;
+}
+
+static int h_prepare_a_kernel_shared_memory(const cudaDeviceProp &prop, size_t shared_bytes) {
+    if (shared_bytes <= (size_t)prop.sharedMemPerBlock) return 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
+    if (shared_bytes <= (size_t)prop.sharedMemPerBlockOptin) {
+        cudaError_t err = cudaFuncSetAttribute(
+            wif_bsgs_search_a_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shared_bytes
+        );
+        return report_cuda_error(err, "set CUDA BSGS A dynamic shared memory limit");
+    }
+#endif
+    fprintf(stderr,
+        "[E] CUDA BSGS A needs %.2f KiB shared memory but device exposes %.2f KiB per block\n",
+        (double)shared_bytes / 1024.0,
+        (double)h_cuda_max_shared_mem_per_block(prop) / 1024.0);
+    return -1;
+}
+
 static uint64_t h_bsgs_split_score(int table_chars, int search_chars) {
     uint64_t table_combs = h_pow58_u64(table_chars);
     uint64_t search_combs = h_pow58_u64(search_chars);
@@ -820,7 +851,7 @@ static int h_choose_threads_per_block(const cudaDeviceProp &prop) {
     for (int i = 0; i < 3; i++) {
         int threads = candidates[i];
         if (prop.maxThreadsPerBlock >= threads &&
-            (size_t)prop.sharedMemPerBlock >= h_cuda_batch_shared_bytes(threads, 3)) {
+            h_cuda_max_shared_mem_per_block(prop) >= h_cuda_batch_shared_bytes(threads, 3)) {
             return threads;
         }
     }
@@ -840,6 +871,156 @@ static int h_choose_cuda_blocks(const cudaDeviceProp &prop, uint64_t total, int 
     if (target_blocks > max_blocks) target_blocks = max_blocks;
     if (target_blocks == 0) target_blocks = 1;
     return (int)target_blocks;
+}
+
+struct HCudaLaunchConfig {
+    int threads;
+    int blocks;
+    size_t shared_bytes;
+    double sample_combos_per_sec;
+};
+
+static uint64_t h_choose_a_chunk_combos(
+    uint64_t total,
+    const HCudaLaunchConfig &config
+) {
+    uint64_t grid_stride = (uint64_t)config.blocks * (uint64_t)config.threads;
+    uint64_t min_chunk = grid_stride > 0 ? grid_stride * 64ULL : 1048576ULL;
+    if (min_chunk < 1048576ULL) min_chunk = 1048576ULL;
+
+    uint64_t chunk = min_chunk;
+    if (config.sample_combos_per_sec > 0.0) {
+        double target_seconds = 30.0;
+        double desired = config.sample_combos_per_sec * target_seconds;
+        if (desired > (double)UINT64_MAX) {
+            chunk = UINT64_MAX;
+        } else if (desired > 0.0) {
+            chunk = (uint64_t)desired;
+        }
+    }
+
+    if (chunk < min_chunk) chunk = min_chunk;
+    if (chunk > total) chunk = total;
+    return chunk == 0 ? total : chunk;
+}
+
+static HCudaLaunchConfig h_autotune_a_launch_config(
+    const cudaDeviceProp &prop,
+    uint64_t total,
+    const GpuPointRaw *d_p_combined_a,
+    const int *d_a_pos,
+    int num_a,
+    int wif_len,
+    const uint32_t *d_pow58_mod32,
+    const GpuPointRaw *d_carry_g,
+    GpuPointRaw base_point_raw,
+    GpuPointRaw g_s_raw,
+    uint32_t c_k,
+    const GpuBsgsEntry *d_table,
+    uint32_t table_mask,
+    GpuBsgsMatch *d_matches,
+    int *d_match_count,
+    int max_matches
+) {
+    HCudaLaunchConfig best;
+    best.threads = h_choose_threads_per_block(prop);
+    best.blocks = h_choose_cuda_blocks(prop, total, best.threads);
+    best.shared_bytes = h_cuda_batch_shared_bytes(best.threads, 3);
+    best.sample_combos_per_sec = 0.0;
+
+    int candidates[] = {256, 128, 64, 32};
+    cudaEvent_t started;
+    cudaEvent_t stopped;
+    if (report_cuda_error(cudaEventCreate(&started), "create CUDA autotune start event") != 0) {
+        return best;
+    }
+    if (report_cuda_error(cudaEventCreate(&stopped), "create CUDA autotune stop event") != 0) {
+        cudaEventDestroy(started);
+        return best;
+    }
+
+    int zero = 0;
+    for (int i = 0; i < 4; i++) {
+        int threads = candidates[i];
+        if (threads > prop.maxThreadsPerBlock) continue;
+
+        size_t shared_bytes = h_cuda_batch_shared_bytes(threads, 3);
+        if (shared_bytes > h_cuda_max_shared_mem_per_block(prop)) continue;
+        if (h_prepare_a_kernel_shared_memory(prop, shared_bytes) != 0) continue;
+
+        int blocks = h_choose_cuda_blocks(prop, total, threads);
+        uint64_t grid_stride = (uint64_t)blocks * (uint64_t)threads;
+        uint64_t bench_combos = grid_stride * 8ULL;
+        if (bench_combos < 1048576ULL) bench_combos = 1048576ULL;
+        if (bench_combos > total) bench_combos = total;
+        if (bench_combos == 0) continue;
+
+        if (report_cuda_error(cudaMemcpy(d_match_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear CUDA autotune match count") != 0) {
+            continue;
+        }
+        if (report_cuda_error(cudaEventRecord(started), "record CUDA autotune start event") != 0) {
+            continue;
+        }
+        wif_bsgs_search_a_kernel<<<blocks, threads, shared_bytes>>>(
+            0,
+            bench_combos,
+            d_p_combined_a,
+            d_a_pos,
+            num_a,
+            wif_len,
+            d_pow58_mod32,
+            d_carry_g,
+            base_point_raw,
+            g_s_raw,
+            c_k,
+            d_table,
+            table_mask,
+            d_matches,
+            d_match_count,
+            max_matches
+        );
+        if (report_cuda_error(cudaGetLastError(), "launch CUDA autotune A kernel") != 0) {
+            continue;
+        }
+        if (report_cuda_error(cudaEventRecord(stopped), "record CUDA autotune stop event") != 0) {
+            continue;
+        }
+        if (report_cuda_error(cudaEventSynchronize(stopped), "synchronize CUDA autotune stop event") != 0) {
+            continue;
+        }
+
+        float elapsed_ms = 0.0f;
+        if (report_cuda_error(cudaEventElapsedTime(&elapsed_ms, started, stopped), "measure CUDA autotune A kernel") != 0) {
+            continue;
+        }
+        if (elapsed_ms <= 0.0f) continue;
+
+        double rate = ((double)bench_combos * 1000.0) / (double)elapsed_ms;
+        printf("[+] CUDA autotune A candidate: threads=%d, blocks=%d, shared=%.2f KiB, %.0f combos/s\n",
+            threads,
+            blocks,
+            (double)shared_bytes / 1024.0,
+            rate);
+        if (rate > best.sample_combos_per_sec) {
+            best.threads = threads;
+            best.blocks = blocks;
+            best.shared_bytes = shared_bytes;
+            best.sample_combos_per_sec = rate;
+        }
+    }
+
+    cudaEventDestroy(started);
+    cudaEventDestroy(stopped);
+    if (report_cuda_error(cudaMemcpy(d_match_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear CUDA autotune match count") != 0) {
+        return best;
+    }
+
+    printf("[+] CUDA autotune A config: threads=%d, blocks=%d, shared=%.2f KiB, sample=%.0f combos/s\n",
+        best.threads,
+        best.blocks,
+        (double)best.shared_bytes / 1024.0,
+        best.sample_combos_per_sec);
+    return best;
 }
 
 static int h_select_cuda_device(
@@ -1297,6 +1478,13 @@ extern "C" int cuda_wif_recovery_bsgs(
     time_t started_at = time(NULL);
     int h_match_count = 0;
     int matches_to_copy = 0;
+    bool saw_point_candidates = false;
+    HCudaLaunchConfig a_config = {0, 0, 0, 0.0};
+    uint64_t a_chunk_combos = 0;
+    uint64_t a_total_launches = 0;
+    uint64_t a_processed = 0;
+    uint64_t a_launch_index = 0;
+    time_t a_started_at = 0;
 
     printf("[+] CUDA launch config: B blocks=%d, A blocks=%d, threads=%d, shared B=%.2f KiB, shared A=%.2f KiB\n",
         b_blocks,
@@ -1419,8 +1607,8 @@ extern "C" int cuda_wif_recovery_bsgs(
     }
 
     printf("[+] CUDA BSGS searching A side on GPU...\n");
-    print_cuda_progress(0, a_combs, 0, 1, started_at, "starting BSGS A");
-    wif_bsgs_search_a_kernel<<<a_blocks, threads_per_block, a_shared_bytes>>>(
+    a_config = h_autotune_a_launch_config(
+        cuda_prop,
         a_combs,
         d_p_combined_a,
         d_a_pos,
@@ -1437,47 +1625,97 @@ extern "C" int cuda_wif_recovery_bsgs(
         d_match_count,
         max_matches
     );
-    if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS A kernel") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS A kernel") != 0) goto cleanup_bsgs;
-    print_cuda_progress(a_combs, a_combs, 0, 1, started_at, "finished BSGS A");
+    threads_per_block = a_config.threads;
+    a_blocks = a_config.blocks;
+    a_shared_bytes = a_config.shared_bytes;
+    if (h_prepare_a_kernel_shared_memory(cuda_prop, a_shared_bytes) != 0) goto cleanup_bsgs;
 
-    if (report_cuda_error(cudaMemcpy(&h_match_count, d_match_count, sizeof(int), cudaMemcpyDeviceToHost), "copy CUDA BSGS match count") != 0) goto cleanup_bsgs;
+    a_chunk_combos = h_choose_a_chunk_combos(a_combs, a_config);
+    a_total_launches = h_div_ceil_u64(a_combs, a_chunk_combos);
+    a_processed = 0;
+    a_launch_index = 0;
+    a_started_at = time(NULL);
 
-    if (h_match_count <= 0) {
+    printf("[+] CUDA A-side progress chunk: %" PRIu64 " combinations, %" PRIu64 " launches\n",
+        a_chunk_combos,
+        a_total_launches);
+    print_cuda_progress(0, a_combs, 0, a_total_launches, a_started_at, "starting BSGS A");
+
+    while (a_processed < a_combs) {
+        uint64_t chunk_combos = a_combs - a_processed;
+        if (chunk_combos > a_chunk_combos) chunk_combos = a_chunk_combos;
+
+        wif_bsgs_search_a_kernel<<<a_blocks, threads_per_block, a_shared_bytes>>>(
+            a_processed,
+            chunk_combos,
+            d_p_combined_a,
+            d_a_pos,
+            num_a,
+            wif_len,
+            d_pow58_mod32,
+            d_carry_g,
+            h_point_to_raw(base_point),
+            h_point_to_raw(g_s),
+            c_k,
+            d_table,
+            table_mask,
+            d_matches,
+            d_match_count,
+            max_matches
+        );
+        if (report_cuda_error(cudaGetLastError(), "launch CUDA BSGS A kernel") != 0) goto cleanup_bsgs;
+        if (report_cuda_error(cudaDeviceSynchronize(), "synchronize CUDA BSGS A kernel") != 0) goto cleanup_bsgs;
+
+        a_processed += chunk_combos;
+        print_cuda_progress(a_processed, a_combs, a_launch_index, a_total_launches, a_started_at, "progress BSGS A");
+
+        if (report_cuda_error(cudaMemcpy(&h_match_count, d_match_count, sizeof(int), cudaMemcpyDeviceToHost), "copy CUDA BSGS match count") != 0) goto cleanup_bsgs;
+        if (h_match_count > 0) {
+            saw_point_candidates = true;
+            matches_to_copy = h_match_count > max_matches ? max_matches : h_match_count;
+            if (h_match_count > max_matches) {
+                fprintf(stderr,
+                    "[W] CUDA BSGS found %d point candidates near A combo %" PRIu64 "; verifying first %d\n",
+                    h_match_count,
+                    a_processed - chunk_combos,
+                    max_matches);
+            }
+            h_matches = (GpuBsgsMatch*)malloc((size_t)matches_to_copy * sizeof(GpuBsgsMatch));
+            if (h_matches == NULL) {
+                fprintf(stderr, "[E] Failed to allocate host CUDA BSGS matches\n");
+                goto cleanup_bsgs;
+            }
+            if (report_cuda_error(cudaMemcpy(h_matches, d_matches, (size_t)matches_to_copy * sizeof(GpuBsgsMatch), cudaMemcpyDeviceToHost), "copy CUDA BSGS matches") != 0) goto cleanup_bsgs;
+
+            for (int i = 0; i < matches_to_copy; i++) {
+                char candidate[128];
+                uint8_t privkey[32];
+                if (!h_build_candidate_wif(partial_wif, h_a_pos, num_a, h_matches[i].packed_a, h_b_pos, num_b, h_matches[i].packed_b, candidate, sizeof(candidate))) {
+                    continue;
+                }
+                if (!h_verify_wif_checksum(candidate, privkey)) {
+                    continue;
+                }
+                if (verify_privkey_pubkey(privkey, target_pubkey, target_pubkey_len, compressed)) {
+                    strcpy(result_wif, candidate);
+                    printf("[+] CUDA BSGS WIF exact match found: %s\n", result_wif);
+                    rc = 0;
+                    goto cleanup_bsgs;
+                }
+            }
+
+            free(h_matches);
+            h_matches = NULL;
+            if (report_cuda_error(cudaMemcpy(d_match_count, &zero, sizeof(int), cudaMemcpyHostToDevice), "clear CUDA BSGS match count") != 0) goto cleanup_bsgs;
+        }
+        a_launch_index++;
+    }
+
+    if (!saw_point_candidates) {
         printf("[-] CUDA BSGS found no point candidates\n");
-        rc = 1;
-        goto cleanup_bsgs;
+    } else {
+        printf("[-] CUDA BSGS point candidates did not pass WIF/public-key verification\n");
     }
-
-    matches_to_copy = h_match_count > max_matches ? max_matches : h_match_count;
-    if (h_match_count > max_matches) {
-        fprintf(stderr, "[W] CUDA BSGS found %d point candidates; verifying first %d\n", h_match_count, max_matches);
-    }
-    h_matches = (GpuBsgsMatch*)malloc((size_t)matches_to_copy * sizeof(GpuBsgsMatch));
-    if (h_matches == NULL) {
-        fprintf(stderr, "[E] Failed to allocate host CUDA BSGS matches\n");
-        goto cleanup_bsgs;
-    }
-    if (report_cuda_error(cudaMemcpy(h_matches, d_matches, (size_t)matches_to_copy * sizeof(GpuBsgsMatch), cudaMemcpyDeviceToHost), "copy CUDA BSGS matches") != 0) goto cleanup_bsgs;
-
-    for (int i = 0; i < matches_to_copy; i++) {
-        char candidate[128];
-        uint8_t privkey[32];
-        if (!h_build_candidate_wif(partial_wif, h_a_pos, num_a, h_matches[i].packed_a, h_b_pos, num_b, h_matches[i].packed_b, candidate, sizeof(candidate))) {
-            continue;
-        }
-        if (!h_verify_wif_checksum(candidate, privkey)) {
-            continue;
-        }
-        if (verify_privkey_pubkey(privkey, target_pubkey, target_pubkey_len, compressed)) {
-            strcpy(result_wif, candidate);
-            printf("[+] CUDA BSGS WIF exact match found: %s\n", result_wif);
-            rc = 0;
-            goto cleanup_bsgs;
-        }
-    }
-
-    printf("[-] CUDA BSGS point candidates did not pass WIF/public-key verification\n");
     rc = 1;
 
 cleanup_bsgs:

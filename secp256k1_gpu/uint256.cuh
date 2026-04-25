@@ -204,7 +204,7 @@ struct uint256 {
     }
 };
 
-/* ---- Global constants ---- */
+/* ---- Constant expressions usable from host and device code ---- */
 
-static const uint256 UINT256_ZERO = uint256(0, 0, 0, 0);
-static const uint256 UINT256_ONE  = uint256(1, 0, 0, 0);
+#define UINT256_ZERO uint256(0ULL, 0ULL, 0ULL, 0ULL)
+#define UINT256_ONE  uint256(1ULL, 0ULL, 0ULL, 0ULL)

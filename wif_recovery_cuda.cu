@@ -229,18 +229,6 @@ static GpuPointRaw h_point_to_raw(Point p) {
     return out;
 }
 
-static Point h_compute_c_g(uint32_t c, Point table[4][256]) {
-    Point p;
-    p.Clear();
-    for (int i = 0; i < 4; i++) {
-        uint8_t byte = (c >> (i * 8)) & 0xFF;
-        if (byte != 0) {
-            p = h_point_add(p, table[i][byte]);
-        }
-    }
-    return p;
-}
-
 static bool h_build_candidate_wif(
     const char *partial_wif,
     const int *a_pos,

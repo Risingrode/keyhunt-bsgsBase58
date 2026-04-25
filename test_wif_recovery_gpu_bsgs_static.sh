@@ -24,6 +24,16 @@ if grep -R -q '\buint256_ONE\b' secp256k1_gpu wif_recovery_cuda.cu; then
     exit 1
 fi
 
+if grep -R -q 'static const uint256 \\(UINT256_ZERO\\|UINT256_ONE\\|FIELD_P\\|FIELD_P_MINUS_2\\|ORDER_N\\)' secp256k1_gpu; then
+    echo "[FAIL] CUDA GPU math constants must be device-visible expressions, not host static objects" >&2
+    exit 1
+fi
+
+if grep -q 'static Point h_compute_c_g' wif_recovery_cuda.cu; then
+    echo "[FAIL] Unused host h_compute_c_g helper should not be compiled into CUDA TU" >&2
+    exit 1
+fi
+
 if awk '
     /goto cleanup_bsgs/ { seen_goto = 1 }
     /^cleanup_bsgs:/ { seen_goto = 0 }

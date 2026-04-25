@@ -268,18 +268,19 @@ static GpuPointRaw h_point_to_raw(Point p) {
 
 static void h_decode_combo_point(
     uint64_t combo,
-    const std::vector<Point> &points,
+    const std::vector<Point> &combined_points,
     const int *positions,
     int num_positions,
     int wif_len,
     const uint32_t *pow58_mod32,
+    Point *carry_g,
     Point *sum_p,
     uint32_t *sum_c,
     uint64_t *packed
 ) {
     Point p;
     p.Clear();
-    uint32_t c = 0;
+    uint64_t c_wide = 0;
     uint64_t bits = 0;
     uint64_t temp = combo;
 
@@ -287,15 +288,21 @@ static void h_decode_combo_point(
         int d = (int)(temp % 58ULL);
         temp /= 58ULL;
         if (d > 0) {
-            Point addend = points[((size_t)i * 58) + d];
+            Point addend = combined_points[((size_t)i * 58) + d];
             p = h_point_add(p, addend);
         }
-        c += (uint32_t)d * pow58_mod32[wif_len - 1 - positions[i]];
+        uint32_t c_part = (uint32_t)((uint32_t)d * pow58_mod32[wif_len - 1 - positions[i]]);
+        c_wide += c_part;
         bits |= ((uint64_t)d << (6 * i));
     }
 
+    uint32_t local_carry = (uint32_t)(c_wide >> 32);
+    if (local_carry > 0) {
+        p = h_point_add(p, carry_g[local_carry]);
+    }
+
     *sum_p = p;
-    *sum_c = c;
+    *sum_c = (uint32_t)c_wide;
     *packed = bits;
 }
 
@@ -306,19 +313,15 @@ static void h_make_b_probe(
     int num_positions,
     int wif_len,
     const uint32_t *pow58_mod32,
-    Point table[4][256],
+    Point *carry_g,
     GpuBsgsBProbe *probe
 ) {
     Point sum_p;
     uint32_t sum_c = 0;
     uint64_t packed = 0;
-    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, &sum_p, &sum_c, &packed);
+    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, carry_g, &sum_p, &sum_c, &packed);
 
-    Point c_p = h_lookup_c_g_from_table(sum_c, table);
-    c_p = h_point_neg(c_p);
-    Point p_b = h_point_add(sum_p, c_p);
-
-    probe->x_prefix = h_point_x_prefix(p_b);
+    probe->x_prefix = h_point_x_prefix(sum_p);
     probe->c_value = sum_c;
     probe->packed = (uint32_t)packed;
     probe->found = 0;
@@ -331,7 +334,7 @@ static void h_make_a_probe(
     int num_positions,
     int wif_len,
     const uint32_t *pow58_mod32,
-    Point table[4][256],
+    Point *carry_g,
     Point base_point,
     Point g_s,
     GpuBsgsAProbe *probe
@@ -339,12 +342,9 @@ static void h_make_a_probe(
     Point sum_p;
     uint32_t sum_c = 0;
     uint64_t packed = 0;
-    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, &sum_p, &sum_c, &packed);
+    h_decode_combo_point(combo, points, positions, num_positions, wif_len, pow58_mod32, carry_g, &sum_p, &sum_c, &packed);
 
-    Point c_p = h_lookup_c_g_from_table(sum_c, table);
-    c_p = h_point_neg(c_p);
-    Point p_a = h_point_add(sum_p, c_p);
-    Point neg_pa = h_point_neg(p_a);
+    Point neg_pa = h_point_neg(sum_p);
     Point target = h_point_add(base_point, neg_pa);
     Point neg_g_s = h_point_neg(g_s);
 
@@ -406,23 +406,64 @@ __device__ __forceinline__ GpuPointRaw point_to_raw(const ECPoint &p) {
     return raw;
 }
 
-__device__ __forceinline__ ECPoint device_compute_c_g(uint32_t c, const GpuPointRaw *t_g) {
-    ECPoint p;
-    p.set_infinity();
-    for (int i = 0; i < 4; i++) {
-        uint8_t byte = (c >> (i * 8)) & 0xFF;
-        if (byte != 0) {
-            p = point_add(p, raw_to_point(t_g[(i * 256) + byte]));
-        }
-    }
-    return p;
-}
-
 __device__ __forceinline__ uint64_t device_point_x_prefix(ECPoint p) {
     if (p.is_infinity()) return 1ULL;
     ECPoint reduced = point_reduce(p);
     uint64_t x = reduced.x.v[0];
     return x == 0 ? 1ULL : x;
+}
+
+__device__ __forceinline__ void block_batch_store_xz(
+    uint256 *xs,
+    uint256 *zs,
+    int index,
+    const ECPoint &p
+) {
+    if (p.is_infinity()) {
+        xs[index] = UINT256_ZERO;
+        zs[index] = UINT256_ZERO;
+        return;
+    }
+
+    xs[index] = p.x;
+    zs[index] = p.z;
+}
+
+__device__ void block_batch_invert_zs(uint256 *zs, uint256 *products, int count) {
+    if (threadIdx.x == 0) {
+        uint256 product = UINT256_ONE;
+
+        for (int i = 0; i < count; i++) {
+            products[i] = product;
+            if (!zs[i].is_zero()) {
+                product = field_mul(product, zs[i]);
+            }
+        }
+
+        uint256 inverse = field_inv(product);
+        for (int i = count - 1; i >= 0; i--) {
+            uint256 z = zs[i];
+            if (!z.is_zero()) {
+                uint256 inv_z = field_mul(inverse, products[i]);
+                inverse = field_mul(inverse, z);
+                zs[i] = inv_z;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ uint64_t block_batch_x_prefix(
+    const uint256 *xs,
+    const uint256 *inv_zs,
+    int index
+) {
+    uint256 inv_z = inv_zs[index];
+    if (inv_z.is_zero()) return 1ULL;
+
+    uint256 x = field_mul(xs[index], inv_z);
+    uint64_t prefix = x.v[0];
+    return prefix == 0 ? 1ULL : prefix;
 }
 
 __device__ void bsgs_insert_entry(GpuBsgsEntry *table, uint32_t table_mask, uint64_t x_prefix, uint32_t c_value, uint32_t packed) {
@@ -445,50 +486,72 @@ __device__ void bsgs_insert_entry(GpuBsgsEntry *table, uint32_t table_mask, uint
 
 __global__ void wif_bsgs_build_b_kernel(
     uint64_t total,
-    const GpuPointRaw *p_missing_b,
+    const GpuPointRaw *p_combined_b,
     const int *b_pos,
     int num_b,
     int wif_len,
     const uint32_t *pow58_mod32,
-    const GpuPointRaw *t_g,
+    const GpuPointRaw *carry_g,
     GpuBsgsEntry *table,
     uint32_t table_mask
 ) {
-    uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
-    uint64_t combo = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (; combo < total; combo += stride) {
+    extern __shared__ uint64_t shared_words[];
+    int batch_points = blockDim.x;
+    uint256 *shared_x = (uint256*)shared_words;
+    uint256 *shared_z = shared_x + batch_points;
+    uint256 *shared_products = shared_z + batch_points;
+
+    uint64_t grid_stride = (uint64_t)blockDim.x * gridDim.x;
+    uint64_t block_start = (uint64_t)blockIdx.x * blockDim.x;
+
+    for (uint64_t tile_base = block_start; tile_base < total; tile_base += grid_stride) {
+        uint64_t combo = tile_base + threadIdx.x;
+        bool active = combo < total;
         ECPoint sum_p;
         sum_p.set_infinity();
-        uint32_t sum_c = 0;
+        uint64_t sum_c_wide = 0;
         uint32_t packed = 0;
         uint64_t temp = combo;
 
-        for (int i = 0; i < num_b; i++) {
-            int d = (int)(temp % 58ULL);
-            temp /= 58ULL;
-            if (d > 0) {
-                sum_p = point_add(sum_p, raw_to_point(p_missing_b[(i * 58) + d]));
+        if (active) {
+            for (int i = 0; i < num_b; i++) {
+                int d = (int)(temp % 58ULL);
+                temp /= 58ULL;
+                if (d > 0) {
+                    sum_p = point_add_affine(sum_p, raw_to_point(p_combined_b[(i * 58) + d]));
+                }
+                uint32_t c_part = (uint32_t)((uint32_t)d * pow58_mod32[wif_len - 1 - b_pos[i]]);
+                sum_c_wide += c_part;
+                packed |= ((uint32_t)d << (6 * i));
             }
-            sum_c += (uint32_t)d * pow58_mod32[wif_len - 1 - b_pos[i]];
-            packed |= ((uint32_t)d << (6 * i));
+
+            uint32_t local_carry = (uint32_t)(sum_c_wide >> 32);
+            if (local_carry > 0) {
+                sum_p = point_add_affine(sum_p, raw_to_point(carry_g[local_carry]));
+            }
         }
 
-        ECPoint c_p = device_compute_c_g(sum_c, t_g);
-        c_p = point_neg(c_p);
-        ECPoint p_b = point_add(sum_p, c_p);
-        uint64_t x_prefix = device_point_x_prefix(p_b);
-        bsgs_insert_entry(table, table_mask, x_prefix, sum_c, packed);
+        block_batch_store_xz(shared_x, shared_z, threadIdx.x, sum_p);
+        __syncthreads();
+        block_batch_invert_zs(shared_z, shared_products, batch_points);
+
+        uint32_t sum_c = (uint32_t)sum_c_wide;
+        if (active) {
+            uint64_t x_prefix = block_batch_x_prefix(shared_x, shared_z, threadIdx.x);
+            bsgs_insert_entry(table, table_mask, x_prefix, sum_c, packed);
+        }
+        __syncthreads();
     }
 }
 
 __global__ void wif_bsgs_search_a_kernel(
     uint64_t total,
-    const GpuPointRaw *p_missing_a,
+    const GpuPointRaw *p_combined_a,
     const int *a_pos,
     int num_a,
     int wif_len,
     const uint32_t *pow58_mod32,
-    const GpuPointRaw *t_g,
+    const GpuPointRaw *carry_g,
     GpuPointRaw base_point_raw,
     GpuPointRaw g_s_raw,
     uint32_t c_k,
@@ -498,61 +561,89 @@ __global__ void wif_bsgs_search_a_kernel(
     int *match_count,
     int max_matches
 ) {
-    uint64_t stride = (uint64_t)blockDim.x * gridDim.x;
-    uint64_t combo = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    extern __shared__ uint64_t shared_words[];
+    int points_per_combo = 3;
+    int batch_points = blockDim.x * points_per_combo;
+    uint256 *shared_x = (uint256*)shared_words;
+    uint256 *shared_z = shared_x + batch_points;
+    uint256 *shared_products = shared_z + batch_points;
+
+    uint64_t grid_stride = (uint64_t)blockDim.x * gridDim.x;
+    uint64_t block_start = (uint64_t)blockIdx.x * blockDim.x;
     ECPoint base_point = raw_to_point(base_point_raw);
     ECPoint g_s = raw_to_point(g_s_raw);
     ECPoint neg_g_s = point_neg(g_s);
 
-    for (; combo < total; combo += stride) {
+    for (uint64_t tile_base = block_start; tile_base < total; tile_base += grid_stride) {
+        uint64_t combo = tile_base + threadIdx.x;
+        bool active = combo < total;
         ECPoint sum_p;
         sum_p.set_infinity();
-        uint32_t sum_c = 0;
+        uint64_t sum_c_wide = 0;
         uint64_t packed = 0;
         uint64_t temp = combo;
 
-        for (int i = 0; i < num_a; i++) {
-            int d = (int)(temp % 58ULL);
-            temp /= 58ULL;
-            if (d > 0) {
-                sum_p = point_add(sum_p, raw_to_point(p_missing_a[(i * 58) + d]));
+        if (active) {
+            for (int i = 0; i < num_a; i++) {
+                int d = (int)(temp % 58ULL);
+                temp /= 58ULL;
+                if (d > 0) {
+                    sum_p = point_add_affine(sum_p, raw_to_point(p_combined_a[(i * 58) + d]));
+                }
+                uint32_t c_part = (uint32_t)((uint32_t)d * pow58_mod32[wif_len - 1 - a_pos[i]]);
+                sum_c_wide += c_part;
+                packed |= ((uint64_t)d << (6 * i));
             }
-            sum_c += (uint32_t)d * pow58_mod32[wif_len - 1 - a_pos[i]];
-            packed |= ((uint64_t)d << (6 * i));
+
+            uint32_t local_carry = (uint32_t)(sum_c_wide >> 32);
+            if (local_carry > 0) {
+                sum_p = point_add_affine(sum_p, raw_to_point(carry_g[local_carry]));
+            }
         }
 
-        ECPoint c_p = device_compute_c_g(sum_c, t_g);
-        c_p = point_neg(c_p);
-        ECPoint p_a = point_add(sum_p, c_p);
-        ECPoint neg_pa = point_neg(p_a);
-        ECPoint target = point_add(base_point, neg_pa);
+        uint32_t sum_c = (uint32_t)sum_c_wide;
+        ECPoint target;
+        target.set_infinity();
+        if (active) {
+            ECPoint neg_pa = point_neg(sum_p);
+            target = point_add(base_point, neg_pa);
+        }
 
+        int point_base = threadIdx.x * points_per_combo;
         for (uint32_t carry = 0; carry <= 2; carry++) {
-            if (carry > 0) {
-                target = point_add(target, neg_g_s);
+            if (active && carry > 0) {
+                target = point_add_affine(target, neg_g_s);
             }
+            block_batch_store_xz(shared_x, shared_z, point_base + (int)carry, target);
+        }
+        __syncthreads();
+        block_batch_invert_zs(shared_z, shared_products, batch_points);
 
-            uint64_t search_x = device_point_x_prefix(target);
-            uint32_t idx = (uint32_t)search_x & table_mask;
+        if (active) {
+            for (uint32_t carry = 0; carry <= 2; carry++) {
+                uint64_t search_x = block_batch_x_prefix(shared_x, shared_z, point_base + (int)carry);
+                uint32_t idx = (uint32_t)search_x & table_mask;
 
-            while (table[idx].x_prefix != 0) {
-                if (table[idx].x_prefix == search_x) {
-                    uint32_t c_b = table[idx].c_value;
-                    uint64_t total_c = (uint64_t)c_k + (uint64_t)sum_c + (uint64_t)c_b;
-                    if ((total_c >> 32) == carry) {
-                        int out_idx = atomicAdd(match_count, 1);
-                        if (out_idx < max_matches) {
-                            matches[out_idx].packed_a = packed;
-                            matches[out_idx].packed_b = table[idx].packed;
-                            matches[out_idx].c_a = sum_c;
-                            matches[out_idx].c_b = c_b;
-                            matches[out_idx].carry = carry;
+                while (table[idx].x_prefix != 0) {
+                    if (table[idx].x_prefix == search_x) {
+                        uint32_t c_b = table[idx].c_value;
+                        uint64_t total_c = (uint64_t)c_k + (uint64_t)sum_c + (uint64_t)c_b;
+                        if ((total_c >> 32) == carry) {
+                            int out_idx = atomicAdd(match_count, 1);
+                            if (out_idx < max_matches) {
+                                matches[out_idx].packed_a = packed;
+                                matches[out_idx].packed_b = table[idx].packed;
+                                matches[out_idx].c_a = sum_c;
+                                matches[out_idx].c_b = c_b;
+                                matches[out_idx].carry = carry;
+                            }
                         }
                     }
+                    idx = (idx + 1) & table_mask;
                 }
-                idx = (idx + 1) & table_mask;
             }
         }
+        __syncthreads();
     }
 }
 
@@ -585,12 +676,12 @@ __global__ void wif_bsgs_probe_b_table_kernel(
 __global__ void wif_bsgs_probe_a_kernel(
     GpuBsgsAProbe *probes,
     int num_probes,
-    const GpuPointRaw *p_missing_a,
+    const GpuPointRaw *p_combined_a,
     const int *a_pos,
     int num_a,
     int wif_len,
     const uint32_t *pow58_mod32,
-    const GpuPointRaw *t_g,
+    const GpuPointRaw *carry_g,
     GpuPointRaw base_point_raw,
     GpuPointRaw g_s_raw
 ) {
@@ -603,7 +694,7 @@ __global__ void wif_bsgs_probe_a_kernel(
     ECPoint neg_g_s = point_neg(g_s);
     ECPoint sum_p;
     sum_p.set_infinity();
-    uint32_t sum_c = 0;
+    uint64_t sum_c_wide = 0;
     uint64_t packed = 0;
     uint64_t temp = combo;
 
@@ -611,16 +702,19 @@ __global__ void wif_bsgs_probe_a_kernel(
         int d = (int)(temp % 58ULL);
         temp /= 58ULL;
         if (d > 0) {
-            sum_p = point_add(sum_p, raw_to_point(p_missing_a[(i * 58) + d]));
+            sum_p = point_add_affine(sum_p, raw_to_point(p_combined_a[(i * 58) + d]));
         }
-        sum_c += (uint32_t)d * pow58_mod32[wif_len - 1 - a_pos[i]];
+        uint32_t c_part = (uint32_t)((uint32_t)d * pow58_mod32[wif_len - 1 - a_pos[i]]);
+        sum_c_wide += c_part;
         packed |= ((uint64_t)d << (6 * i));
     }
 
-    ECPoint c_p = device_compute_c_g(sum_c, t_g);
-    c_p = point_neg(c_p);
-    ECPoint p_a = point_add(sum_p, c_p);
-    ECPoint neg_pa = point_neg(p_a);
+    uint32_t local_carry = (uint32_t)(sum_c_wide >> 32);
+    if (local_carry > 0) {
+        sum_p = point_add_affine(sum_p, raw_to_point(carry_g[local_carry]));
+    }
+    uint32_t sum_c = (uint32_t)sum_c_wide;
+    ECPoint neg_pa = point_neg(sum_p);
     ECPoint target = point_add(base_point, neg_pa);
 
     probes[probe_idx].c_value = sum_c;
@@ -655,7 +749,7 @@ static size_t h_cuda_bsgs_aux_bytes(int table_chars, int search_chars, int max_m
     return
         table_points * sizeof(GpuPointRaw) +
         search_points * sizeof(GpuPointRaw) +
-        (4ULL * 256ULL * sizeof(GpuPointRaw)) +
+        (WIF_BSGS_MAX_SEARCH_CHARS + 1ULL) * sizeof(GpuPointRaw) +
         (table_chars > 0 ? (size_t)table_chars : 1ULL) * sizeof(int) +
         (search_chars > 0 ? (size_t)search_chars : 1ULL) * sizeof(int) +
         64ULL * sizeof(uint32_t) +
@@ -663,6 +757,10 @@ static size_t h_cuda_bsgs_aux_bytes(int table_chars, int search_chars, int max_m
         sizeof(int) +
         probe_count * sizeof(GpuBsgsBProbe) +
         probe_count * sizeof(GpuBsgsAProbe);
+}
+
+static size_t h_cuda_batch_shared_bytes(int threads_per_block, int points_per_combo) {
+    return (size_t)threads_per_block * (size_t)points_per_combo * 3ULL * sizeof(uint256);
 }
 
 static uint64_t h_bsgs_split_score(int table_chars, int search_chars) {
@@ -718,9 +816,15 @@ static int h_choose_table_chars_for_memory(
 }
 
 static int h_choose_threads_per_block(const cudaDeviceProp &prop) {
-    if (prop.maxThreadsPerBlock >= 256) return 256;
-    if (prop.maxThreadsPerBlock >= 128) return 128;
-    if (prop.maxThreadsPerBlock >= 64) return 64;
+    int candidates[] = {128, 64, 32};
+    for (int i = 0; i < 3; i++) {
+        int threads = candidates[i];
+        if (prop.maxThreadsPerBlock >= threads &&
+            (size_t)prop.sharedMemPerBlock >= h_cuda_batch_shared_bytes(threads, 3)) {
+            return threads;
+        }
+    }
+    if (prop.maxThreadsPerBlock >= 32) return 32;
     return prop.maxThreadsPerBlock > 0 ? prop.maxThreadsPerBlock : 32;
 }
 
@@ -1051,19 +1155,26 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
     }
 
-    GpuPointRaw h_t_g_raw[4 * 256];
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 256; j++) {
-            h_t_g_raw[(i * 256) + j] = h_point_to_raw(h_t_g[i][j]);
+    Point h_carry_g[WIF_BSGS_MAX_SEARCH_CHARS + 1];
+    GpuPointRaw h_carry_g_raw[WIF_BSGS_MAX_SEARCH_CHARS + 1];
+    h_carry_g[0].Clear();
+    h_carry_g_raw[0] = h_point_to_raw(h_carry_g[0]);
+    for (int i = 1; i <= WIF_BSGS_MAX_SEARCH_CHARS; i++) {
+        Int scalar((uint64_t)i);
+        for (int k = 0; k < 32; k++) {
+            scalar.Add(&scalar);
+            scalar.Mod(&secp->order);
         }
+        h_carry_g[i] = h_multiply_g(scalar);
+        h_carry_g_raw[i] = h_point_to_raw(h_carry_g[i]);
     }
 
     size_t b_points_count = num_b > 0 ? (size_t)num_b * 58 : 1;
     size_t a_points_count = num_a > 0 ? (size_t)num_a * 58 : 1;
-    std::vector<GpuPointRaw> h_p_missing_b(b_points_count);
-    std::vector<GpuPointRaw> h_p_missing_a(a_points_count);
-    std::vector<Point> h_p_missing_b_points(b_points_count);
-    std::vector<Point> h_p_missing_a_points(a_points_count);
+    std::vector<GpuPointRaw> h_p_combined_b(b_points_count);
+    std::vector<GpuPointRaw> h_p_combined_a(a_points_count);
+    std::vector<Point> h_p_combined_b_points(b_points_count);
+    std::vector<Point> h_p_combined_a_points(a_points_count);
 
     for (int i = 0; i < num_b; i++) {
         Int exp(1);
@@ -1074,15 +1185,19 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         Point zero;
         zero.Clear();
-        h_p_missing_b_points[(size_t)i * 58] = zero;
-        h_p_missing_b[(size_t)i * 58] = h_point_to_raw(zero);
+        h_p_combined_b_points[(size_t)i * 58] = zero;
+        h_p_combined_b[(size_t)i * 58] = h_point_to_raw(zero);
         for (int d = 1; d < 58; d++) {
             Int digit_exp(&exp);
             digit_exp.Mult((uint64_t)d);
             digit_exp.Mod(&secp->order);
             Point p_d = h_multiply_g(digit_exp);
-            h_p_missing_b_points[((size_t)i * 58) + d] = p_d;
-            h_p_missing_b[((size_t)i * 58) + d] = h_point_to_raw(p_d);
+            uint32_t c_part = (uint32_t)((uint32_t)d * h_pow58_mod32[p]);
+            Point c_p = h_lookup_c_g_from_table(c_part, h_t_g);
+            c_p = h_point_neg(c_p);
+            Point combined = h_point_add(p_d, c_p);
+            h_p_combined_b_points[((size_t)i * 58) + d] = combined;
+            h_p_combined_b[((size_t)i * 58) + d] = h_point_to_raw(combined);
         }
     }
 
@@ -1095,17 +1210,25 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         Point zero;
         zero.Clear();
-        h_p_missing_a_points[(size_t)i * 58] = zero;
-        h_p_missing_a[(size_t)i * 58] = h_point_to_raw(zero);
+        h_p_combined_a_points[(size_t)i * 58] = zero;
+        h_p_combined_a[(size_t)i * 58] = h_point_to_raw(zero);
         for (int d = 1; d < 58; d++) {
             Int digit_exp(&exp);
             digit_exp.Mult((uint64_t)d);
             digit_exp.Mod(&secp->order);
             Point p_d = h_multiply_g(digit_exp);
-            h_p_missing_a_points[((size_t)i * 58) + d] = p_d;
-            h_p_missing_a[((size_t)i * 58) + d] = h_point_to_raw(p_d);
+            uint32_t c_part = (uint32_t)((uint32_t)d * h_pow58_mod32[p]);
+            Point c_p = h_lookup_c_g_from_table(c_part, h_t_g);
+            c_p = h_point_neg(c_p);
+            Point combined = h_point_add(p_d, c_p);
+            h_p_combined_a_points[((size_t)i * 58) + d] = combined;
+            h_p_combined_a[((size_t)i * 58) + d] = h_point_to_raw(combined);
         }
     }
+
+    printf("[+] CUDA BSGS precomputed combined digit tables: B=%zu points, A=%zu points\n",
+        h_p_combined_b.size(),
+        h_p_combined_a.size());
 
     uint64_t b_combs = h_pow58_u64(num_b);
     uint64_t a_combs = h_pow58_u64(num_a);
@@ -1122,7 +1245,7 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         if (!duplicate && b_probe_combos[i] < b_combs) {
             GpuBsgsBProbe probe;
-            h_make_b_probe(b_probe_combos[i], h_p_missing_b_points, h_b_pos, num_b, wif_len, h_pow58_mod32, h_t_g, &probe);
+            h_make_b_probe(b_probe_combos[i], h_p_combined_b_points, h_b_pos, num_b, wif_len, h_pow58_mod32, h_carry_g, &probe);
             h_b_probes.push_back(probe);
         }
     }
@@ -1133,7 +1256,7 @@ extern "C" int cuda_wif_recovery_bsgs(
         }
         if (!duplicate && a_probe_combos[i] < a_combs) {
             GpuBsgsAProbe probe;
-            h_make_a_probe(a_probe_combos[i], h_p_missing_a_points, h_a_pos, num_a, wif_len, h_pow58_mod32, h_t_g, base_point, g_s, &probe);
+            h_make_a_probe(a_probe_combos[i], h_p_combined_a_points, h_a_pos, num_a, wif_len, h_pow58_mod32, h_carry_g, base_point, g_s, &probe);
             h_a_expected_probes.push_back(probe);
             h_a_device_probes.push_back(probe);
         }
@@ -1152,9 +1275,9 @@ extern "C" int cuda_wif_recovery_bsgs(
         table_size, (double)table_bytes / 1073741824.0);
     printf("[+] CUDA BSGS combinations: table=%" PRIu64 ", search=%" PRIu64 "\n", b_combs, a_combs);
 
-    GpuPointRaw *d_p_missing_b = NULL;
-    GpuPointRaw *d_p_missing_a = NULL;
-    GpuPointRaw *d_t_g = NULL;
+    GpuPointRaw *d_p_combined_b = NULL;
+    GpuPointRaw *d_p_combined_a = NULL;
+    GpuPointRaw *d_carry_g = NULL;
     int *d_b_pos = NULL;
     int *d_a_pos = NULL;
     uint32_t *d_pow58_mod32 = NULL;
@@ -1167,20 +1290,24 @@ extern "C" int cuda_wif_recovery_bsgs(
     int zero = 0;
     int rc = -1;
     int threads_per_block = h_choose_threads_per_block(cuda_prop);
+    size_t b_shared_bytes = h_cuda_batch_shared_bytes(threads_per_block, 1);
+    size_t a_shared_bytes = h_cuda_batch_shared_bytes(threads_per_block, 3);
     int b_blocks = h_choose_cuda_blocks(cuda_prop, b_combs, threads_per_block);
     int a_blocks = h_choose_cuda_blocks(cuda_prop, a_combs, threads_per_block);
     time_t started_at = time(NULL);
     int h_match_count = 0;
     int matches_to_copy = 0;
 
-    printf("[+] CUDA launch config: B blocks=%d, A blocks=%d, threads=%d\n",
+    printf("[+] CUDA launch config: B blocks=%d, A blocks=%d, threads=%d, shared B=%.2f KiB, shared A=%.2f KiB\n",
         b_blocks,
         a_blocks,
-        threads_per_block);
+        threads_per_block,
+        (double)b_shared_bytes / 1024.0,
+        (double)a_shared_bytes / 1024.0);
 
-    if (report_cuda_error(cudaMalloc((void**)&d_p_missing_b, h_p_missing_b.size() * sizeof(GpuPointRaw)), "allocate B missing points") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMalloc((void**)&d_p_missing_a, h_p_missing_a.size() * sizeof(GpuPointRaw)), "allocate A missing points") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMalloc((void**)&d_t_g, sizeof(h_t_g_raw)), "allocate T_G table") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMalloc((void**)&d_p_combined_b, h_p_combined_b.size() * sizeof(GpuPointRaw)), "allocate B combined points") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMalloc((void**)&d_p_combined_a, h_p_combined_a.size() * sizeof(GpuPointRaw)), "allocate A combined points") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMalloc((void**)&d_carry_g, sizeof(h_carry_g_raw)), "allocate carry adjustment points") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_b_pos, (num_b > 0 ? num_b : 1) * sizeof(int)), "allocate B positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_a_pos, (num_a > 0 ? num_a : 1) * sizeof(int)), "allocate A positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_pow58_mod32, 64 * sizeof(uint32_t)), "allocate pow58 table") != 0) goto cleanup_bsgs;
@@ -1191,9 +1318,9 @@ extern "C" int cuda_wif_recovery_bsgs(
     if (report_cuda_error(cudaMalloc((void**)&d_matches, max_matches * sizeof(GpuBsgsMatch)), "allocate CUDA BSGS matches") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMalloc((void**)&d_match_count, sizeof(int)), "allocate CUDA BSGS match count") != 0) goto cleanup_bsgs;
 
-    if (report_cuda_error(cudaMemcpy(d_p_missing_b, h_p_missing_b.data(), h_p_missing_b.size() * sizeof(GpuPointRaw), cudaMemcpyHostToDevice), "copy B missing points") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMemcpy(d_p_missing_a, h_p_missing_a.data(), h_p_missing_a.size() * sizeof(GpuPointRaw), cudaMemcpyHostToDevice), "copy A missing points") != 0) goto cleanup_bsgs;
-    if (report_cuda_error(cudaMemcpy(d_t_g, h_t_g_raw, sizeof(h_t_g_raw), cudaMemcpyHostToDevice), "copy T_G table") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMemcpy(d_p_combined_b, h_p_combined_b.data(), h_p_combined_b.size() * sizeof(GpuPointRaw), cudaMemcpyHostToDevice), "copy B combined points") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMemcpy(d_p_combined_a, h_p_combined_a.data(), h_p_combined_a.size() * sizeof(GpuPointRaw), cudaMemcpyHostToDevice), "copy A combined points") != 0) goto cleanup_bsgs;
+    if (report_cuda_error(cudaMemcpy(d_carry_g, h_carry_g_raw, sizeof(h_carry_g_raw), cudaMemcpyHostToDevice), "copy carry adjustment points") != 0) goto cleanup_bsgs;
     if (num_b > 0 && report_cuda_error(cudaMemcpy(d_b_pos, h_b_pos, num_b * sizeof(int), cudaMemcpyHostToDevice), "copy B positions") != 0) goto cleanup_bsgs;
     if (num_a > 0 && report_cuda_error(cudaMemcpy(d_a_pos, h_a_pos, num_a * sizeof(int), cudaMemcpyHostToDevice), "copy A positions") != 0) goto cleanup_bsgs;
     if (report_cuda_error(cudaMemcpy(d_pow58_mod32, h_pow58_mod32, 64 * sizeof(uint32_t), cudaMemcpyHostToDevice), "copy pow58 table") != 0) goto cleanup_bsgs;
@@ -1202,14 +1329,14 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     printf("[+] CUDA BSGS building B table on GPU...\n");
     print_cuda_progress(0, b_combs, 0, 1, started_at, "starting BSGS B");
-    wif_bsgs_build_b_kernel<<<b_blocks, threads_per_block>>>(
+    wif_bsgs_build_b_kernel<<<b_blocks, threads_per_block, b_shared_bytes>>>(
         b_combs,
-        d_p_missing_b,
+        d_p_combined_b,
         d_b_pos,
         num_b,
         wif_len,
         d_pow58_mod32,
-        d_t_g,
+        d_carry_g,
         d_table,
         table_mask
     );
@@ -1251,12 +1378,12 @@ extern "C" int cuda_wif_recovery_bsgs(
         wif_bsgs_probe_a_kernel<<<1, 32>>>(
             d_a_probes,
             (int)h_a_device_probes.size(),
-            d_p_missing_a,
+            d_p_combined_a,
             d_a_pos,
             num_a,
             wif_len,
             d_pow58_mod32,
-            d_t_g,
+            d_carry_g,
             h_point_to_raw(base_point),
             h_point_to_raw(g_s)
         );
@@ -1293,14 +1420,14 @@ extern "C" int cuda_wif_recovery_bsgs(
 
     printf("[+] CUDA BSGS searching A side on GPU...\n");
     print_cuda_progress(0, a_combs, 0, 1, started_at, "starting BSGS A");
-    wif_bsgs_search_a_kernel<<<a_blocks, threads_per_block>>>(
+    wif_bsgs_search_a_kernel<<<a_blocks, threads_per_block, a_shared_bytes>>>(
         a_combs,
-        d_p_missing_a,
+        d_p_combined_a,
         d_a_pos,
         num_a,
         wif_len,
         d_pow58_mod32,
-        d_t_g,
+        d_carry_g,
         h_point_to_raw(base_point),
         h_point_to_raw(g_s),
         c_k,
@@ -1354,9 +1481,9 @@ extern "C" int cuda_wif_recovery_bsgs(
     rc = 1;
 
 cleanup_bsgs:
-    if (d_p_missing_b != NULL) cudaFree(d_p_missing_b);
-    if (d_p_missing_a != NULL) cudaFree(d_p_missing_a);
-    if (d_t_g != NULL) cudaFree(d_t_g);
+    if (d_p_combined_b != NULL) cudaFree(d_p_combined_b);
+    if (d_p_combined_a != NULL) cudaFree(d_p_combined_a);
+    if (d_carry_g != NULL) cudaFree(d_carry_g);
     if (d_b_pos != NULL) cudaFree(d_b_pos);
     if (d_a_pos != NULL) cudaFree(d_a_pos);
     if (d_pow58_mod32 != NULL) cudaFree(d_pow58_mod32);

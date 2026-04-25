@@ -342,13 +342,14 @@ static void h_make_a_probe(
     Point p_a = h_point_add(sum_p, c_p);
     Point neg_pa = h_point_neg(p_a);
     Point target = h_point_add(base_point, neg_pa);
+    Point neg_g_s = h_point_neg(g_s);
 
     probe->combo = combo;
     probe->c_value = sum_c;
     probe->packed = packed;
     for (uint32_t carry = 0; carry <= 2; carry++) {
         if (carry > 0) {
-            target = h_point_add(target, g_s);
+            target = h_point_add(target, neg_g_s);
         }
         probe->x_prefix[carry] = h_point_x_prefix(target);
     }
@@ -497,6 +498,7 @@ __global__ void wif_bsgs_search_a_kernel(
     uint64_t combo = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     ECPoint base_point = raw_to_point(base_point_raw);
     ECPoint g_s = raw_to_point(g_s_raw);
+    ECPoint neg_g_s = point_neg(g_s);
 
     for (; combo < total; combo += stride) {
         ECPoint sum_p;
@@ -523,7 +525,7 @@ __global__ void wif_bsgs_search_a_kernel(
 
         for (uint32_t carry = 0; carry <= 2; carry++) {
             if (carry > 0) {
-                target = point_add(target, g_s);
+                target = point_add(target, neg_g_s);
             }
 
             uint64_t search_x = device_point_x_prefix(target);
@@ -594,6 +596,7 @@ __global__ void wif_bsgs_probe_a_kernel(
     uint64_t combo = probes[probe_idx].combo;
     ECPoint base_point = raw_to_point(base_point_raw);
     ECPoint g_s = raw_to_point(g_s_raw);
+    ECPoint neg_g_s = point_neg(g_s);
     ECPoint sum_p;
     sum_p.set_infinity();
     uint32_t sum_c = 0;
@@ -620,7 +623,7 @@ __global__ void wif_bsgs_probe_a_kernel(
     probes[probe_idx].packed = packed;
     for (uint32_t carry = 0; carry <= 2; carry++) {
         if (carry > 0) {
-            target = point_add(target, g_s);
+            target = point_add(target, neg_g_s);
         }
         probes[probe_idx].x_prefix[carry] = device_point_x_prefix(target);
     }

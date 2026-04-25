@@ -39,6 +39,11 @@ if grep -Eq 'Jacobian|z_inv2|z_inv3|Z1²|Z1³|Z2²|Z2³|X / Z²|Y / Z³' secp256
     exit 1
 fi
 
+if grep -q 'target = point_add(target, g_s)' wif_recovery_cuda.cu || grep -q 'Target = point_add(Target, G_S)' wif_recovery_cpu.cpp; then
+    echo "[FAIL] BSGS checksum carry must subtract 2^32*G from the A-side target, not add it" >&2
+    exit 1
+fi
+
 if awk '
     /goto cleanup_bsgs/ { seen_goto = 1 }
     /^cleanup_bsgs:/ { seen_goto = 0 }

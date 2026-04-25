@@ -303,10 +303,11 @@ void dfs_A(int idx, Point sum_P, uint32_t sum_C, uint64_t packed) {
         Point Base_minus_PA = point_add(BasePoint, Neg_PA);
         
         Point Target = Base_minus_PA;
+        Point Neg_G_S = point_neg(G_S);
         
         for(int carry = 0; carry <= 2; carry++) {
             if (carry > 0) {
-                Target = point_add(Target, G_S);
+                Target = point_add(Target, Neg_G_S);
             }
             
             Point T = Target;
